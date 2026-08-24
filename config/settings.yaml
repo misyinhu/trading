@@ -107,3 +107,12 @@ okx:
       min_size: 10
     - symbol: "BTC-USDT"
       min_size: 10
+
+# 风控闸门配置
+risk_gate:
+  max_daily_loss_pct: 0.05
+  max_leverage: 3.0
+  min_correlation: 0.7
+  zscore_warn: 3.0
+  zscore_critical: 4.0
+  max_open_positions: 3
