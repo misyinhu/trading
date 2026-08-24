@@ -1686,12 +1686,65 @@ def get_orders_endpoint():
 
 @app.route("/health", methods=["GET"])
 def health():
-    config_status = {
+    """自检所有组件状态"""
+    components = {}
+    overall = "ok"
+
+    # 1. 飞书配置
+    components["feishu"] = {
         "app_id": bool(FEISHU_APP_ID),
         "conversation_id": bool(FEISHU_CONVERSATION_ID),
-        "query_only": QUERY_ONLY,
     }
-    return jsonify({"status": "ok", "config": config_status})
+
+    # 2. RiskGate 可用性
+    try:
+        from orders.risk_gate import RiskGate, OrderContext, GateMode
+        gate = RiskGate()
+        ctx = OrderContext(symbol="HEALTH", action="BUY", quantity=1, exchange="IB")
+        result = gate.pre_check(ctx, mode=GateMode.ADVISORY)
+        components["risk_gate"] = {"status": "ok", "rules": len(gate.rules)}
+    except Exception as e:
+        components["risk_gate"] = {"status": "error", "error": str(e)}
+        overall = "degraded"
+
+    # 3. Signal API 可用性
+    try:
+        from notify.signal_handler import _read_signals
+        signals = _read_signals()
+        components["signal_api"] = {"status": "ok", "stored_signals": len(signals)}
+    except Exception as e:
+        components["signal_api"] = {"status": "error", "error": str(e)}
+        overall = "degraded"
+
+    # 4. OrderManager 可用性
+    try:
+        from orders.order_manager import OrderManager
+        mgr = OrderManager()
+        components["order_manager"] = {"status": "ok"}
+    except Exception as e:
+        components["order_manager"] = {"status": "error", "error": str(e)}
+        overall = "degraded"
+
+    # 5. query_only 模式
+    components["query_only"] = QUERY_ONLY
+
+    status_code = 200 if overall == "ok" else 503
+    return jsonify({"status": overall, "components": components}), status_code
+
+
+@app.route("/health/full", methods=["GET"])
+def health_full():
+    """深度自检 — 含 IB 连接状态（可能较慢）"""
+    result = json.loads(health()[0].data)
+    try:
+        ib = get_ib_connection()
+        result["components"]["ib_connection"] = {
+            "status": "ok" if ib and ib.isConnected() else "disconnected",
+            "connected": bool(ib and ib.isConnected()),
+        }
+    except Exception as e:
+        result["components"]["ib_connection"] = {"status": "error", "error": str(e)}
+    return jsonify(result)
 
 
 @app.route("/test-mtf", methods=["POST"])
