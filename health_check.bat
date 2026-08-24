@@ -49,7 +49,8 @@ timeout /t 5 /nobreak > NUL
 
 REM 重启
 cd /d C:\projects\trading
-start /B python notify\webhook_bridge.py > webhook.log 2>&1
+set PYTHON=C:\Users\wang\AppData\Local\Programs\Python\Python312\python.exe
+start /B %PYTHON% notify\webhook_bridge.py > webhook.log 2>&1
 
 timeout /t 10 /nobreak > NUL
 

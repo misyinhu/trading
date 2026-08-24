@@ -15,12 +15,12 @@ def check(url: str, label: str) -> bool:
         resp = requests.get(url, timeout=10)
         data = resp.json()
         if resp.status_code != 200:
-            print(f"  ❌ {label}: HTTP {resp.status_code}")
+            print(f"  [FAIL] {label}: HTTP {resp.status_code}")
             return False
-        print(f"  ✅ {label}: {json.dumps(data, ensure_ascii=False)[:120]}")
+        print(f"  [PASS] {label}: {json.dumps(data, ensure_ascii=False)[:120]}")
         return True
     except Exception as e:
-        print(f"  ❌ {label}: {e}")
+        print(f"  [FAIL] {label}: {e}")
         return False
 
 
@@ -32,7 +32,7 @@ def main():
     base = args.url.rstrip("/")
     failures = 0
 
-    print(f"🔍 Trading 烟雾测试 — {base}\n")
+    print(f"[SMOKE] Trading smoke test -- {base}\n")
 
     # 1. 基础健康检查
     if not check(f"{base}/health", "GET /health"):
@@ -54,26 +54,26 @@ def main():
         }, timeout=10)
         data = resp.json()
         if resp.status_code in (200, 201) and "signal_id" in data:
-            print(f"  ✅ POST /api/signals: signal_id={data['signal_id'][:20]}... status={data.get('status')}")
+            print(f"  [PASS] POST /api/signals: signal_id={data['signal_id'][:20]}... status={data.get('status')}")
         else:
-            print(f"  ❌ POST /api/signals: {resp.status_code} {json.dumps(data, ensure_ascii=False)[:120]}")
+            print(f"  [FAIL] POST /api/signals: {resp.status_code} {json.dumps(data, ensure_ascii=False)[:120]}")
             failures += 1
     except Exception as e:
-        print(f"  ❌ POST /api/signals: {e}")
+        print(f"  [FAIL] POST /api/signals: {e}")
         failures += 1
 
     # 4. 信号查询（不存在的信号应返回 404）
     try:
         resp = requests.get(f"{base}/api/signals/nonexistent", timeout=10)
         if resp.status_code == 404:
-            print(f"  ✅ GET /api/signals/<id>: 正确返回 404")
+            print(f"  [PASS] GET /api/signals/<id>: 正确返回 404")
         else:
-            print(f"  ⚠️ GET /api/signals/<id>: HTTP {resp.status_code} (expected 404)")
+            print(f"  [WARN] GET /api/signals/<id>: HTTP {resp.status_code} (expected 404)")
     except Exception as e:
-        print(f"  ❌ GET /api/signals/<id>: {e}")
+        print(f"  [FAIL] GET /api/signals/<id>: {e}")
         failures += 1
 
-    print(f"\n{'✅ 全部通过' if failures == 0 else f'❌ {failures} 项失败'}")
+    print(f"\n{'[PASS] All checks passed' if failures == 0 else f'[FAIL] {failures} checks failed'}")
     sys.exit(0 if failures == 0 else 1)
 
 
