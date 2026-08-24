@@ -1316,6 +1316,33 @@ def feishu_webhook():
     try:
         order_result = None  # 捕获订单结果用于 HTTP 响应
         event = request.json
+
+        # ========== 请求格式归一化 ==========
+        # 支持简化测试格式: {"message": {"content": "买入1手GC"}}
+        # 自动转换为 Feishu 事件格式
+        if event.get("message") and not event.get("header"):
+            msg_data = event["message"]
+            raw = msg_data.get("content", "")
+            # content 可能是纯文本或 JSON 字符串
+            try:
+                json.loads(raw)
+            except (TypeError, ValueError):
+                raw = json.dumps({"text": raw})
+            from warnings import simplefilter
+
+            # 归一化为 Schema 2.0 格式
+            event = {
+                "header": {"event_type": "im.message.receive_v1"},
+                "event": {
+                    "message": {
+                        "content": raw,
+                        "message_id": msg_data.get("message_id", ""),
+                        "chat_id": msg_data.get("chat_id", FEISHU_CONVERSATION_ID),
+                    }
+                },
+            }
+        # ====================================
+
         logger.info(f"[FEISHU] Event: {json.dumps(event, ensure_ascii=False)}")
 
         if event.get("type") == "url_verification" or event.get("challenge"):
@@ -1441,7 +1468,7 @@ def feishu_webhook():
                     if quantity is None:
                         quantity = 1
 
-                    if action and action != "UNKNOWN":
+                    if action in ("BUY", "SELL", "CLOSE"):
                         # ===== 订单级去重（60秒内相同订单，文件缓存支持多worker）=====
                         import time as _time, threading as _threading, json as _json
 
@@ -1472,9 +1499,10 @@ def feishu_webhook():
                                 except:
                                     pass
                         if _ISDUP:
+                            _sym_str = symbol if symbol else "N/A"
                             _MSG = (
                                 "\u26a0\ufe0f **重复订单已拦截**（60秒内相同订单）\n标的: "
-                                + symbol
+                                + _sym_str
                                 + " | 方向: "
                                 + _ACN
                                 + " | 数量: "
@@ -1681,6 +1709,46 @@ def test_mtf():
         return jsonify({"status": "error", "message": "invalid command"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# === Signal API endpoints ===
+@app.route("/api/signals", methods=["POST"])
+def api_submit_signal():
+    """Agent 提交交易信号"""
+    from notify.signal_handler import handle_submit_signal
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "invalid JSON"}), 400
+    result = handle_submit_signal(data)
+    status_code = 201 if result.get("status") == "reviewed" else 200
+    return jsonify(result), status_code
+
+
+@app.route("/api/signals/<signal_id>/confirm", methods=["POST"])
+def api_confirm_signal(signal_id):
+    """人确认/拒绝信号"""
+    from notify.signal_handler import handle_confirm_signal
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "invalid JSON"}), 400
+    action = data.get("action", "confirm")
+    result = handle_confirm_signal(signal_id, action)
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result), 200
+
+
+@app.route("/api/signals/<signal_id>", methods=["GET"])
+def api_get_signal(signal_id):
+    """查询信号状态"""
+    from notify.signal_handler import handle_get_signal
+    result = handle_get_signal(signal_id)
+    if "error" in result:
+        return jsonify(result), 404
+    return jsonify(result), 200
+# === Signal API endpoints end ===
 
 
 if __name__ == "__main__":
