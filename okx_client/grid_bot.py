@@ -108,6 +108,17 @@ class GridBot:
     
     def place_order(self, inst_id, side, size):
         """下单"""
+        from orders.risk_gate import RiskGate, OrderContext, GateMode
+        _risk_gate = RiskGate()
+        _risk_ctx = OrderContext(
+            symbol=inst_id, action="BUY" if side == "buy" else "SELL",
+            quantity=float(size), exchange="OKX",
+        )
+        _risk_result = _risk_gate.final_check(_risk_ctx, mode=GateMode.STRICT)
+        if not _risk_result.allowed:
+            print(f"  [RISK BLOCKED] {_risk_result.reason}")
+            return False
+
         try:
             result = self.client.place_order(inst_id, side, str(size), ord_type="market")
             if result.get("code") == "0":

@@ -182,6 +182,16 @@ def _place_order_impl(
     except Exception:
         pass
 
+    # ── 风控闸门 (advisory: 记录不拦截) ────────────────────────────────────
+    from orders.risk_gate import RiskGate, OrderContext, GateMode
+    _risk_gate = RiskGate()
+    _risk_ctx = OrderContext(
+        symbol=symbol, action=action, quantity=float(quantity), exchange="IB",
+    )
+    _risk_result = _risk_gate.final_check(_risk_ctx, mode=GateMode.ADVISORY)
+    if _risk_result.warnings:
+        print(f"[RISK] {symbol} {action} {quantity}: {'; '.join(_risk_result.warnings)}", flush=True)
+
     if ib is None:
         return {"error": "IB连接为空"}
     if not ib.isConnected():
