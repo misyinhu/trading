@@ -4,7 +4,7 @@ info:
   description: |
     TradingView Webhook -> 飞书 中转服务
     支持Webhook URL、飞书消息控制、命令执行、自然语言下单
-  version: 1.1.0
+  version: 1.2.0
   contact:
     name: Trading Project
 servers:
@@ -362,6 +362,98 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/CtpMainContractResponse'}
 
+
+  /api/gm/account:
+    get:
+      summary: 掘金量化(gm) A股模拟账户资金
+      description: |
+        经本地掘金终端(localhost:7001)查询模拟账户。走独立 venv(gm_env) 子进程
+        run(mode=1) 框架；gm SDK 依赖 protobuf<4，与系统隔离。?force=1 跳过 20s 缓存。
+      tags: [GM]
+      parameters:
+        - {name: force, in: query, required: false, schema: {type: string, enum: ["1", "0"]}}
+      responses:
+        '200':
+          description: 账户资金
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GmAccountResponse'}
+        '503':
+          description: 终端/服务不可达或未配置 GM_TOKEN
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+
+  /api/gm/positions:
+    get:
+      summary: 掘金量化(gm) 模拟持仓
+      tags: [GM]
+      parameters:
+        - {name: force, in: query, required: false, schema: {type: string, enum: ["1", "0"]}}
+      responses:
+        '200':
+          description: 持仓列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  channel: {type: string, example: gm}
+                  count: {type: integer}
+                  positions:
+                    type: array
+                    items: {$ref: '#/components/schemas/GmPosition'}
+
+  /api/gm/order:
+    post:
+      summary: 掘金量化(gm) 模拟下单（A股个股/期货）
+      description: |
+        平台内模拟撮合。side: 1买/2卖；order_type: 1限价/2市价；
+        position_effect: 1开/2平。A股股票数量≥100股。
+      tags: [GM]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GmOrderRequest'}
+            example:
+              symbol: SHSE.600000
+              side: 1
+              volume: 100
+              order_type: 1
+              position_effect: 1
+              price: 10.5
+      responses:
+        '200':
+          description: 下单结果（action_result 含 cl_ord_id/status/filled_volume）
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GmActionResponse'}
+        '400':
+          description: 参数错误或被拒（ord_rej_reason_detail）
+        '503':
+          description: gm 子进程超时/崩溃/未配置
+
+  /api/gm/cancel:
+    post:
+      summary: 掘金量化(gm) 撤未成交委托
+      description: 按 symbol 撤该账户未成交委托；省略 symbol 撤全部。
+      tags: [GM]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                symbol: {type: string, example: SHSE.600000}
+      responses:
+        '200':
+          description: 撤单结果（status=cancel_submitted / nothing_to_cancel）
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GmActionResponse'}
+
 components:
   schemas:
     TVWebhookRequest:
@@ -707,6 +799,68 @@ components:
           type: array
           items: {$ref: '#/components/schemas/CtpInstrument'}
 
+    GmPosition:
+      type: object
+      properties:
+        symbol: {type: string, example: SHSE.600000}
+        direction: {type: string, example: long}
+        volume: {type: integer}
+        avg_price: {type: number}
+        float_pnl: {type: number}
+        market_value: {type: number}
+        channel: {type: string, example: gm}
+
+    GmAccountResponse:
+      type: object
+      properties:
+        status: {type: string, example: logined}
+        channel: {type: string, example: gm}
+        account:
+          type: object
+          properties:
+            account_id: {type: string}
+            balance: {type: number, description: 净值(总权益)}
+            available: {type: number}
+            market_value: {type: number}
+            frozen: {type: number}
+            pnl: {type: number}
+            fpnl: {type: number}
+            currency: {type: string, example: CNY}
+
+    GmOrderRequest:
+      type: object
+      required: [symbol, side, volume]
+      properties:
+        symbol: {type: string, example: SHSE.600000, description: "交易所代码，A股 SHSE./SZSE.，期货 CFFEX./SHFE. 等"}
+        side: {type: integer, description: "1 买 / 2 卖", example: 1}
+        volume: {type: integer, description: "数量（A股≥100股；期货为手数）", example: 100}
+        order_type: {type: integer, description: "1 限价(默认) / 2 市价", example: 1}
+        position_effect: {type: integer, description: "1 开仓(默认) / 2 平仓", example: 1}
+        price: {type: number, description: 限价（order_type=1 时必填）}
+
+    GmActionResponse:
+      type: object
+      properties:
+        ok: {type: boolean}
+        status: {type: string, description: "submitted/rejected/cancel_submitted/nothing_to_cancel/crashed/timeout"}
+        channel: {type: string, example: gm}
+        action_result:
+          type: object
+          properties:
+            cl_ord_id: {type: string}
+            symbol: {type: string}
+            side: {type: integer}
+            price: {type: number}
+            volume: {type: integer}
+            filled_volume: {type: integer}
+            status: {type: integer}
+            ord_rej_reason_detail: {type: string}
+        cancelled: {type: integer}
+        count: {type: integer}
+        positions:
+          type: array
+          items: {$ref: '#/components/schemas/GmPosition'}
+
     ErrorResponse:
       type: object
       properties:
@@ -718,6 +872,8 @@ components:
         - error
 
 tags:
+  - name: GM
+    description: 掘金量化 A 股模拟交易（独立 venv 子进程，本地掘金终端）
   - name: CTP
     description: CTP/SimNow 期货仿真交易（子进程隔离 worker）
   - name: Webhook

@@ -257,3 +257,90 @@ res = ta.submit_ctp_order(iid, "CFFEX",
 - 仿真环境；正式看穿式（`ctp_live`）AppID/AuthCode/RelayAPPID/终端信息待期货公司下发。
 - 报单当前以限价为主；市价单 `price_type=1` 视柜台支持。
 - 中金所股指日内/隔夜规则（如 14:55 前强平）在策略层控制，不在本接口。
+
+---
+
+# 掘金量化（gm）A 股模拟交易接口
+
+> 掘金量化「我的掘金终端」提供平台内模拟撮合，覆盖 **A 股个股 + 期货**，不碰真实资金。
+> 与 CTP 同风格、同样走子进程隔离，但 SDK 为 Python `gm`（需独立 venv，因其 pin
+> `protobuf<4`，会与 streamlit 冲突）。依赖本地掘金终端运行（服务 `localhost:7001`）。
+
+## 基础信息
+
+| 项 | 值 |
+|---|---|
+| 接口前缀 | `/api/gm/*` |
+| 运行环境 | 独立 venv `C:\projects\gm_env`（`gm==3.0.186`）|
+| 终端服务 | 本地掘金终端 `localhost:7001`（终端须登录运行）|
+| 凭证 | `.streamlit/secrets.toml`：`GM_TOKEN` / `GM_ACCOUNT`（模拟账户 UUID）/ `GM_SERV_ADDR` |
+| 隔离 | gm 原生层在独立子进程 `run(mode=1)` 框架内，结果经临时文件 `GM_RESULT_FILE` 回传 |
+| 缓存 | 账户/持仓 20s，`?force=1` 跳过 |
+
+## 接口清单
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/gm/account` | 模拟账户资金（净值/可用/持仓市值/冻结/盈亏）|
+| GET | `/api/gm/positions` | 当前持仓 |
+| POST | `/api/gm/order` | 下单（限价/市价，买/卖，开/平）|
+| POST | `/api/gm/cancel` | 撤未成交委托（按 symbol，省略撤全部）|
+
+## 1. 查询账户
+
+`GET /api/gm/account[?force=1]`
+
+```json
+{
+  "status": "logined", "channel": "gm",
+  "account": {
+    "account_id": "0080a3eb-a5df-11f1-a7e7-00163e022aa6",
+    "balance": 1000000.0, "available": 1000000.0,
+    "market_value": 0.0, "frozen": 0.0,
+    "pnl": 0.0, "fpnl": 0.0, "currency": "CNY"
+  }
+}
+```
+
+## 2. 查询持仓
+
+`GET /api/gm/positions[?force=1]` → `{"positions":[...],"count":N,"channel":"gm"}`。
+
+## 3. 下单
+
+`POST /api/gm/order`
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `symbol` | 是 | 交易所代码，如 `SHSE.600000`（浦发银行）、`SZSE.000001`；期货如 `CFFEX.IC2609` |
+| `side` | 是 | `1` 买 / `2` 卖 |
+| `volume` | 是 | 数量（A 股股票 ≥100 股；期货为手数）|
+| `order_type` | 否 | `1` 限价（默认）/ `2` 市价 |
+| `position_effect` | 否 | `1` 开仓（默认）/ `2` 平仓（期货用；股票自动同净持仓方向）|
+| `price` | 限价必填 | 限价（`order_type=1` 时给 >0）|
+
+请求示例：
+
+```bash
+curl -X POST http://100.99.204.126:5002/api/gm/order \
+  -H "Content-Type: application/json" \
+  -d '{"symbol":"SHSE.600000","side":1,"volume":100,"order_type":1,"position_effect":1,"price":10.5}'
+```
+
+返回 `action_result` 含 `cl_ord_id` / `symbol` / `side` / `price` / `volume` /
+`filled_volume` / `status` / `ord_rej_reason_detail`（被拒原因）。
+
+## 4. 撤单
+
+`POST /api/gm/cancel`，Body：`{"symbol":"SHSE.600000"}`（按标的撤该账户未成交委托；
+省略 symbol 撤全部）。返回 `{"status":"cancel_submitted","cancelled":N}` 或
+`"nothing_to_cancel"`。
+
+## 注意事项
+
+- 仅在 **A 股交易时段**（工作日 9:30–11:30 / 13:00–15:00）下单会真实进入模拟撮合；
+  非交易时段远价单会被终端拒绝/不留存（已验证 `order_volume` 提交成功返回委托）。
+- 掘金终端必须在 winclaw 上保持登录运行；终端服务地址默认 `localhost:7001`。
+- gm SDK 裸调 `get_cash/order_volume`（不走 `run()` 框架）会在原生层阻塞退出，
+  务必使用 `gmsim_worker.py` 的 `run(mode=1)` 回调模式。
+- 部署见 `gm_client/README.md`（建 venv → `pip install gm` → 复制 worker → 配 secrets）。
