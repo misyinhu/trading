@@ -106,7 +106,45 @@ def init(context):
     acct = os.environ.get("GM_ACCOUNT", "")
     try:
         from gm.api import get_cash, get_position, order_volume, get_unfinished_orders, order_cancel
-        if ACTION == "account":
+        if ACTION == "history":
+            from gm.api import history as gm_history
+            sym = ORDER["symbol"]
+            freq = ORDER.get("frequency", "1h")
+            # gm frequency 用秒；接受 '30m'/'1h'/'1d' 或秒数
+            sec_map = {"60": 60, "1m": 60, "300": 300, "5m": 300,
+                       "900": 900, "15m": 900, "1800": 1800, "30m": 1800,
+                       "3600": 3600, "1h": 3600, "60m": 3600,
+                       "86400": 86400, "1d": 86400, "1D": 86400}
+            freq_s = sec_map.get(str(freq), 3600)
+            # gm history 的 frequency 必须是字符串（内部 .strip()）：秒数加 's'，日线 '1d'
+            freq_arg = "1d" if int(freq_s) == 86400 else f"{int(freq_s)}s"
+            st = ORDER.get("start_time", "")
+            et = ORDER.get("end_time", "")
+            df = gm_history(symbol=sym, frequency=freq_arg, start_time=st,
+                            end_time=et, df=True,
+                            fields="bob,eob,open,high,low,close,volume,amount")
+            bars = []
+            try:
+                for _, r in df.iterrows():
+                    def _ts(v):
+                        try:
+                            return v.isoformat() if hasattr(v, "isoformat") else str(v)
+                        except Exception:  # noqa: BLE001
+                            return str(v)
+                    bars.append({
+                        "timestamp": _ts(r.get("eob") or r.get("bob")),
+                        "open": _num(r.get("open")), "high": _num(r.get("high")),
+                        "low": _num(r.get("low")), "close": _num(r.get("close")),
+                        "volume": _num(r.get("volume")), "amount": _num(r.get("amount")),
+                        "symbol": sym, "frequency": freq,
+                    })
+            except Exception as e:  # noqa: BLE001
+                _emit({"ok": False, "status": "error", "error": f"history 解析失败: {e}"})
+            else:
+                _emit({"ok": True, "status": "logined", "symbol": sym,
+                       "frequency": freq, "interval_min": freq_s / 60.0,
+                       "bars": bars, "count": len(bars)})
+        elif ACTION == "account":
             c = get_cash(account_id=acct)
             _emit({"ok": True, "status": "logined", "account": _norm_cash(c)})
         elif ACTION == "positions":

@@ -2684,6 +2684,30 @@ def _gm_run(action: str, order: dict | None = None, timeout: float = 45.0,
     return bool(result.get("ok")), result
 
 
+@app.route("/api/gm/history", methods=["GET"])
+def api_gm_history():
+    """
+    GET /api/gm/history?symbol=SHSE.600000&frequency=1h&start_time=2026-08-01&end_time=2026-09-01
+    掘金 K 线历史（只读）。frequency: 1m/5m/15m/30m/1h/1d（或秒数）。
+    返回 {bars:[{timestamp,open,high,low,close,volume,amount}...], count, interval_min}。
+    走 gm_env 子进程 run(mode=1) 框架。
+    """
+    symbol = (request.args.get("symbol", "") or "").strip()
+    if not symbol:
+        return jsonify({"ok": False, "error": "缺少 symbol（如 SHSE.600000）"}), 400
+    order = {
+        "symbol": symbol,
+        "frequency": request.args.get("frequency", "1h"),
+        "start_time": request.args.get("start_time", ""),
+        "end_time": request.args.get("end_time", ""),
+    }
+    ok, res = _gm_run("history", order, timeout=60.0)
+    if not ok:
+        code = 503 if res.get("status") in ("timeout", "crashed", "disabled") else 500
+        return jsonify(res), code
+    return jsonify(res), 200
+
+
 @app.route("/api/gm/account", methods=["GET"])
 def api_gm_account():
     """GET /api/gm/account[?force=1] — 掘金模拟账户资金（走本地掘金终端）。"""

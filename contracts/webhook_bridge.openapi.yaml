@@ -4,7 +4,7 @@ info:
   description: |
     TradingView Webhook -> 飞书 中转服务
     支持Webhook URL、飞书消息控制、命令执行、自然语言下单
-  version: 1.2.0
+  version: 1.3.0
   contact:
     name: Trading Project
 servers:
@@ -453,6 +453,49 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/GmActionResponse'}
+
+  /api/gm/history:
+    get:
+      summary: 掘金量化(gm) K 线历史（只读，走本地掘金终端）
+      description: |
+        经 gm_env 子进程 run(mode=1) 调 gm.api.history。frequency 为 1m/5m/15m/30m/1h/1d
+        （内部转 `3600s`/`1d` 字符串）。期货 symbol 必须带交易所前缀且用【具体月份合约】：
+        SC/LU 在 INE（如 INE.sc2610、INE.lu2610），FU/AU/CU 在 SHFE（如 SHFE.fu2609），
+        股指在 CFFEX（如 CFFEX.IC2609），A 股 SHSE/SZSE。连续合约 `xxx88` 的 history 返空。
+      tags: [GM]
+      parameters:
+        - {name: symbol, in: query, required: true, schema: {type: string}, description: "gm 合约代码，如 INE.sc2610 / SHSE.600000"}
+        - {name: frequency, in: query, required: false, schema: {type: string, default: "1h"}, description: "1m/5m/15m/30m/1h/1d"}
+        - {name: start_time, in: query, required: false, schema: {type: string}, description: "YYYY-MM-DD"}
+        - {name: end_time, in: query, required: false, schema: {type: string}, description: "YYYY-MM-DD"}
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  status: {type: string}
+                  symbol: {type: string}
+                  frequency: {type: string}
+                  interval_min: {type: number}
+                  count: {type: integer}
+                  bars:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        timestamp: {type: string, description: "ISO8601（eob，北京时间）"}
+                        open: {type: number}
+                        high: {type: number}
+                        low: {type: number}
+                        close: {type: number}
+                        volume: {type: number}
+                        amount: {type: number}
+        '503':
+          description: gm 子进程超时/崩溃/未配置
 
 components:
   schemas:
