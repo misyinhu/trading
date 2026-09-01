@@ -16,3 +16,7 @@ data/*.json
 .DS_Store
 AGENTS.md
 .streamlit/secrets.toml
+# 密钥/凭据统一外置到环境变量或 .streamlit/secrets.toml（不入库）
+**/.streamlit/secrets.toml
+**/secrets.toml
+settings_cxclaw.yaml

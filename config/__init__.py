@@ -77,14 +77,64 @@ def _get_from_env(key: str, default: Any = None) -> Any:
     return default
 
 
+
+# ── 密钥外置：环境变量 > .streamlit/secrets.toml > settings.yaml ──
+# secrets.toml 已被 .gitignore；明文密钥不再写入受版本控制的 settings.yaml。
+_SECRETS_CACHE: Dict[str, Any] | None = None
+
+
+def _secrets_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "..", ".streamlit", "secrets.toml")
+
+
+def _load_secrets() -> Dict[str, Any]:
+    global _SECRETS_CACHE
+    if _SECRETS_CACHE is not None:
+        return _SECRETS_CACHE
+    data: Dict[str, Any] = {}
+    path = _secrets_path()
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            data = tomllib.load(f) or {}
+    except Exception:
+        data = {}
+    _SECRETS_CACHE = data
+    return data
+
+
+def _secret(*names: str, default: str = "") -> str:
+    """按优先级取密钥：环境变量 → secrets.toml → default。"""
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v
+    sec = _load_secrets()
+    for n in names:
+        v = sec.get(n)
+        if v:
+            return str(v)
+    return default
+
+
 def get_feishu_app_id() -> str:
-    """获取飞书 App ID"""
-    return _get_from_env("feishu", {}).get("app_id", get("feishu.app_id", ""))
+    """获取飞书 App ID（优先环境变量/secrets，回退 settings.yaml）。"""
+    return _secret("FEISHU_APP_ID",
+                   default=_get_from_env("feishu", {}).get("app_id", get("feishu.app_id", "")))
 
 
 def get_feishu_app_secret() -> str:
-    """获取飞书 App Secret"""
-    return _get_from_env("feishu", {}).get("app_secret", get("feishu.app_secret", ""))
+    """获取飞书 App Secret（仅从环境变量/secrets.toml 读取，不依赖 settings.yaml 明文）。"""
+    return _secret("FEISHU_APP_SECRET",
+                   default=_get_from_env("feishu", {}).get("app_secret")
+                   if not _is_placeholder(_get_from_env("feishu", {}).get("app_secret"))
+                   else "")
+
+
+def _is_placeholder(v: Any) -> bool:
+    if not v:
+        return True
+    return str(v).strip().startswith("__") and str(v).strip().endswith("__")
 
 
 def get_feishu_chat_id() -> str:
@@ -130,3 +180,26 @@ def get_volcengine_config() -> Dict[str, Any]:
 def is_volcengine_enabled() -> bool:
     """检查火山引擎是否启用"""
     return get("volcengine.enabled", False)
+
+
+# ─── SimNow / CTP 配置 ──────────────────────────────────────────
+
+def get_simnow_flag() -> str:
+    """获取 SimNow 模式: sim / live"""
+    return get("simnow.flag", "sim")
+
+
+def get_simnow_md_server() -> str:
+    return get("simnow.md_server", "tcp://218.80.240.6:20002")
+
+
+def get_simnow_td_server() -> str:
+    return get("simnow.td_server", "tcp://218.80.240.6:20003")
+
+
+def get_simnow_broker_id() -> str:
+    return get("simnow.broker_id", "9999")
+
+
+def get_simnow_auth_code() -> str:
+    return get("simnow.auth_code", "0000000000")

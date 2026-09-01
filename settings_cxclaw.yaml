@@ -9,7 +9,7 @@ environments:
     ib_port: 4002
     feishu:
       app_id: "cli_a9f5b420c9f85cca"
-      app_secret: "dD87XinteNoxupSbKimr9qkfQh6MVdAS"
+      app_secret: "__SET_VIA_SECRETS__"  # 从 .streamlit/secrets.toml 或 FEISHU_APP_SECRET 读取
       api_endpoint: "https://open.feishu.cn/open-apis/im/v1/messages"
       auth_endpoint: "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
       chat_id: "oc_7455ec51aff3a187248914f978b834e3"
@@ -25,7 +25,7 @@ environments:
     ibkr_port: 4001
     feishu:
       app_id: "cli_a90efe262cf99bd6"
-      app_secret: "ibSzkvdHwPh3Rcf342PPZYDzDOl4FrCJ"
+      app_secret: "__SET_VIA_SECRETS__"  # 从 .streamlit/secrets.toml 或 FEISHU_APP_SECRET 读取
       api_endpoint: "https://open.feishu.cn/open-apis/im/v1/messages"
       auth_endpoint: "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
       chat_id: "oc_184cd41ff1e8bfc5588f1612d7ec1635"
@@ -41,7 +41,7 @@ environments:
     ibkr_port: 4002
     feishu:
       app_id: "cli_a9f5b420c9f85cca"
-      app_secret: "dD87XinteNoxupSbKimrariqkfQh6MVdAS"
+      app_secret: "__SET_VIA_SECRETS__"  # 从 .streamlit/secrets.toml 或 FEISHU_APP_SECRET 读取
       api_endpoint: "https://open.feishu.cn/open-apis/im/v1/messages"
       auth_endpoint: "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
       chat_id: "oc_7455ec51aff3a187248914f978b834e3"

@@ -1,118 +1,103 @@
-# 交易系统配置文件
-
-# 环境配置
-environments:
-  local:
-    python_path: /Users/wang/miniconda3/bin/python3
-    project_root: /Users/wang/.opencode/workspace/trading
-    use_venv: false
-    ib_port: 4002
-    feishu:
-      app_id: "cli_a9f5b420c9f85cca"
-      app_secret: "dD87XinteNoxupSbKimr9qkfQh6MVdAS"
-      api_endpoint: "https://open.feishu.cn/open-apis/im/v1/messages"
-      auth_endpoint: "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-      chat_id: "oc_7455ec51aff3a187248914f978b834e3"
-      message_type: "text"
-      timeout: 30
-
-  osclaw:
-    python_path: /Users/openclaw/trading_env/bin/python3
-    project_root: /Users/openclaw/.openclaw/workspace/trading
-    use_venv: true
-    ib_port: 4001
-    feishu:
-      app_id: "cli_a90efe262cf99bd6"
-      app_secret: "ibSzkvdHwPh3Rcf342PPZYDzDOl4FrCJ"
-      api_endpoint: "https://open.feishu.cn/open-apis/im/v1/messages"
-      auth_endpoint: "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-      chat_id: "oc_184cd41ff1e8bfc5588f1612d7ec1635"
-      message_type: "text"
-      timeout: 30
-
-  winclaw:
-    python_path: C:/Users/wang/AppData/Local/Programs/Python/Python312/python.exe
-    project_root: C:/projects/trading
-    use_venv: false
-    ib_port: 4002
-    feishu:
-      app_id: "cli_a9f5b420c9f85cca"
-      app_secret: "dD87XinteNoxupSbKimr9qkfQh6MVdAS"
-      api_endpoint: "https://open.feishu.cn/open-apis/im/v1/messages"
-      auth_endpoint: "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-      chat_id: "oc_7455ec51aff3a187248914f978b834e3"
-      message_type: "text"
-      timeout: 30
-
-  cxclaw:
-    python_path: C:/Users/Apple/AppData/Local/Programs/Python/Python312/python.exe
-    project_root: D:/projects/trading
-    use_venv: false
-    ib_port: 4002
-    feishu:
-      app_id: "cli_a9f5b420c9f85cca"
-      app_secret: "dD87XinteNoxupSbKimr9qkfQh6MVdAS"
-      api_endpoint: "https://open.feishu.cn/open-apis/im/v1/messages"
-      auth_endpoint: "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-      chat_id: "oc_7455ec51aff3a187248914f978b834e3"
-      message_type: "text"
-      timeout: 30
-
-# 当前环境
-current: winclaw
-
-# 查询模式
-query_only: false
-
-# 主合约配置
 contracts:
-  BTC: "BTC.USD"
-  GC: "GCM4"
-  ES: "ESH4"
-
-# 火山引擎豆包大模型配置（已禁用，改用规则匹配）
-volcengine:
-  enabled: false
-
-# quant-core API 配置
+  BTC: BTC.USD
+  ES: ESH4
+  GC: GCM4
+current: winclaw
+environments:
+  cxclaw:
+    feishu:
+      api_endpoint: https://open.feishu.cn/open-apis/im/v1/messages
+      app_id: cli_a9f5b420c9f85cca
+      app_secret: "__SET_VIA_SECRETS__"  # 从 .streamlit/secrets.toml 或 FEISHU_APP_SECRET 读取
+      auth_endpoint: https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal
+      chat_id: oc_7455ec51aff3a187248914f978b834e3
+      message_type: text
+      timeout: 30
+    ib_port: 4002
+    project_root: D:/projects/trading
+    python_path: C:/Users/Apple/AppData/Local/Programs/Python/Python312/python.exe
+    quant_agent_callback_url: http://localhost:5001
+    use_venv: false
+  local:
+    feishu:
+      api_endpoint: https://open.feishu.cn/open-apis/im/v1/messages
+      app_id: cli_a9f5b420c9f85cca
+      app_secret: "__SET_VIA_SECRETS__"  # 从 .streamlit/secrets.toml 或 FEISHU_APP_SECRET 读取
+      auth_endpoint: https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal
+      chat_id: oc_7455ec51aff3a187248914f978b834e3
+      message_type: text
+      timeout: 30
+    ib_port: 4002
+    project_root: /Users/wang/.opencode/workspace/trading
+    python_path: /Users/wang/miniconda3/bin/python3
+    quant_agent_callback_url: http://localhost:5001
+    use_venv: false
+  osclaw:
+    feishu:
+      api_endpoint: https://open.feishu.cn/open-apis/im/v1/messages
+      app_id: cli_a90efe262cf99bd6
+      app_secret: "__SET_VIA_SECRETS__"  # 从 .streamlit/secrets.toml 或 FEISHU_APP_SECRET 读取
+      auth_endpoint: https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal
+      chat_id: oc_184cd41ff1e8bfc5588f1612d7ec1635
+      message_type: text
+      timeout: 30
+    ib_port: 4001
+    project_root: /Users/openclaw/.openclaw/workspace/trading
+    python_path: /Users/openclaw/trading_env/bin/python3
+    quant_agent_callback_url: http://localhost:5001
+    use_venv: true
+  winclaw:
+    feishu:
+      api_endpoint: https://open.feishu.cn/open-apis/im/v1/messages
+      app_id: cli_a9f5b420c9f85cca
+      app_secret: "__SET_VIA_SECRETS__"  # 从 .streamlit/secrets.toml 或 FEISHU_APP_SECRET 读取
+      auth_endpoint: https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal
+      chat_id: oc_7455ec51aff3a187248914f978b834e3
+      message_type: text
+      timeout: 30
+    ib_port: 4002
+    project_root: C:/projects/trading
+    python_path: C:/Users/wang/AppData/Local/Programs/Python/Python312/python.exe
+    quant_agent_callback_url: http://localhost:5001
+    use_venv: false
+okx:
+  flag: sim
+  pairs:
+  - min_size: 1
+    symbol: DOGE-USDT
+  - min_size: 10
+    symbol: ETH-USDT
+  - min_size: 10
+    symbol: BTC-USDT
+simnow:
+  flag: sim   # sim=SimNow模拟, live=SimNow生产（接真实CTP）
+  # CTP 原生(SWIG .pyd)在当前账号登录时会触发进程级崩溃，会带走 Flask 主服务。
+  # 默认关闭 CTP 入口；待子进程隔离/有效 SimNow 账号就绪后改 true 或设 SIMNOW_ENABLED=1。
+  enabled: true
+  # SimNow 第一套环境地址（官网公告）
+  #   交易: 182.254.243.31:30001  行情: 182.254.243.31:30011
+  # 第一套标准环境（交易时段可用）。7x24 环境 40001/40011 当前不可达（2026-09 实测 TCP fail）。
+  md_server: "tcp://182.254.243.31:30011"
+  td_server: "tcp://182.254.243.31:30001"
+  broker_id: "9999"
+  app_id: "simnow_client_test"     # 官方默认 APPID
+  auth_code: "0000000000000000"     # 官方默认认证码（16位零）
+  # 账户信息从 secrets.toml 读取：
+  #   SIMNOW_SIM_USER / SIMNOW_SIM_PASSWORD
 quant_core:
-  url: "http://100.99.204.126:8005"
+  client_id: '10'
   timeout: 30
-  client_id: "10"
-
-# tradingview CDP集成配置
-tv_cdp:
-  url: "http://127.0.0.1"
-  port: 9223
-# OKX 交易配置
-okx:
-  # 交易模式: sim=模拟盘, live=实盘
-  flag: sim
-  # 交易对配置
-  pairs:
-    - symbol: "DOGE-USDT"
-      min_size: 1
-    - symbol: "ETH-USDT"
-      min_size: 10
-    - symbol: "BTC-USDT"
-      min_size: 10
-
-# OKX 交易配置
-okx:
-  flag: sim
-  pairs:
-    - symbol: "DOGE-USDT"
-      min_size: 1
-    - symbol: "ETH-USDT"
-      min_size: 10
-    - symbol: "BTC-USDT"
-      min_size: 10
-
-# 风控闸门配置
+  url: http://100.99.204.126:8005
+query_only: false
 risk_gate:
   max_daily_loss_pct: 0.05
   max_leverage: 3.0
-  min_correlation: 0.7
-  zscore_warn: 3.0
-  zscore_critical: 4.0
   max_open_positions: 3
+  min_correlation: 0.7
+  zscore_critical: 4.0
+  zscore_warn: 3.0
+tv_cdp:
+  port: 9224
+  url: http://127.0.0.1
+volcengine:
+  enabled: false
