@@ -104,11 +104,12 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         self.api = api
         self.cfg = cfg
         self.state = state
-        self.action = action              # query / order / cancel
+        self.action = action              # query / order / cancel / instruments
         self.order = order or {}
         self._rid = 100
         self._order_ref = ""
         self._settled_fired = False
+        self._instr_done = False
 
     def _nrid(self):
         self._rid += 1
@@ -178,6 +179,13 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             self.state["settled"] = True
             _log("settlement confirmed")
         self._settled_fired = True
+        if self.action == "instruments":
+            try:
+                self._do_query_instruments()
+            except Exception as e:  # noqa: BLE001
+                _log(f"instrument query submit error: {type(e).__name__}: {e}")
+                self._instr_done = True
+            return
         if self.action in ("order", "cancel"):
             try:
                 if self.action == "order":
@@ -277,6 +285,28 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
 
     def _do_cancel(self):
         o = self.order
+        sysid = str(o.get("order_sys_id", "") or "").strip()
+        ref = str(o.get("order_ref", "") or "").strip()
+        front = o.get("front_id")
+        sess = o.get("session_id")
+        # 跨连接撤单：若只有 order_ref、没有有效 sysid/session，先查当日委托补全。
+        if not sysid and (ref or o.get("instrument_id")) and (not sess or int(sess or 0) == 0):
+            self.state["_cancel_pending"] = {"ref": ref, "sysid": sysid}
+            q = T.CThostFtdcQryOrderField()
+            q.BrokerID = self.cfg["broker_id"]
+            q.InvestorID = self.state["investor"]
+            if o.get("instrument_id"):
+                q.InstrumentID = str(o["instrument_id"])
+            _log(f"cancel: query orders first to locate ref={ref}")
+            rc = self.api.ReqQryOrder(q, self._nrid())
+            if rc != 0:
+                self.state["action_done"] = True
+                self.state["action_result"] = {"ok": False,
+                                               "error": f"ReqQryOrder ret={rc}"}
+            return
+        self._send_cancel(o, sysid=sysid, ref=ref, front=front, sess=sess)
+
+    def _send_cancel(self, o, *, sysid, ref, front, sess):
         f = T.CThostFtdcInputOrderActionField()
         f.BrokerID = self.cfg["broker_id"]
         f.InvestorID = self.state["investor"]
@@ -284,22 +314,107 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         f.InstrumentID = str(o["instrument_id"])
         f.ExchangeID = str(o.get("exchange_id", ""))
         f.ActionFlag = "0"  # 撤单
-        sysid = str(o.get("order_sys_id", "") or "").strip()
-        if sysid:
-            # 跨会话撤单：优先用交易所系统号
+        # CTP 撤单标准键 = FrontID+SessionID+OrderRef（跨连接可靠）；
+        # OrderSysID 撤单在 SimNow 跨连接偶发 [25]，仅作最后备选。
+        have_ref = bool(ref) and (sess not in (None, 0, "0"))
+        if have_ref:
+            f.FrontID = int(front or self.state.get("front_id", 0))
+            f.SessionID = int(sess)
+            f.OrderRef = str(ref)
+        elif sysid:
             f.OrderSysID = sysid
         else:
-            f.FrontID = int(o.get("front_id", self.state.get("front_id", 0)))
-            f.SessionID = int(o.get("session_id", self.state.get("session_id", 0)))
-            f.OrderRef = str(o["order_ref"])
-        self.state["action_result"] = {"ok": False, "cancel_for": o.get("order_ref") or sysid,
+            f.FrontID = int(front or self.state.get("front_id", 0))
+            f.SessionID = int(sess or self.state.get("session_id", 0))
+            f.OrderRef = str(ref)
+        self.state["action_result"] = {"ok": False, "cancel_for": ref or sysid,
                                        "instrument_id": f.InstrumentID}
-        _log(f"cancel order ref={o.get('order_ref')} sysid={sysid} {f.InstrumentID}")
+        _log(f"cancel order ref={ref} sysid={sysid} front={f.FrontID if not sysid else '-'} sess={f.SessionID if not sysid else '-'} {f.InstrumentID}")
         rc = self.api.ReqOrderAction(f, self._nrid())
         if rc != 0:
             self.state["action_done"] = True
             self.state["action_result"] = {"ok": False,
                                            "error": f"ReqOrderAction ret={rc}"}
+
+    def OnRspQryOrder(self, p, info, n, last):
+        if p is not None:
+            try:
+                rec = {
+                    "order_ref": str(getattr(p, "OrderRef", "") or ""),
+                    "order_sys_id": str(getattr(p, "OrderSysID", "") or "").strip(),
+                    "front_id": int(getattr(p, "FrontID", 0) or 0),
+                    "session_id": int(getattr(p, "SessionID", 0) or 0),
+                    "instrument_id": str(getattr(p, "InstrumentID", "") or ""),
+                    "exchange_id": str(getattr(p, "ExchangeID", "") or ""),
+                    "status": str(getattr(p, "OrderStatus", "") or ""),
+                }
+                self.state["orders"].append(rec)
+            except Exception as e:  # noqa: BLE001
+                _log(f"qry order parse fail: {e}")
+        if last and self.state.get("_cancel_pending"):
+            pend = self.state.pop("_cancel_pending")
+            want_ref = pend.get("ref", "")
+            want_iid = str(self.order.get("instrument_id", ""))
+            # 找未成交/部分成交（status 1/2/3，'1'=PartTradedQueueing '2'=PartTradedNotQueueing '3'=NoTradeQueueing）
+            active = [r for r in self.state["orders"]
+                      if r["status"] in ("1", "2", "3", "a") and
+                      (not want_ref or r["order_ref"] == want_ref) and
+                      (not want_iid or r["instrument_id"] == want_iid)]
+            _log(f"qry orders done: {len(self.state['orders'])} total, {len(active)} active")
+            if not active:
+                self.state["action_done"] = True
+                self.state["action_result"] = {
+                    "ok": False,
+                    "error": f"未找到可撤挂单(ref={want_ref or 'any'}, {want_iid})；"
+                             f"当日委托 {len(self.state['orders'])} 条"}
+                return
+            tgt = active[-1]
+            self._send_cancel(self.order, sysid=tgt["order_sys_id"],
+                              ref=tgt["order_ref"], front=tgt["front_id"],
+                              sess=tgt["session_id"])
+
+    def _do_query_instruments(self):
+        # 按品种前缀查合约。order 里传 product（如 "IC"）/exchange（如 "CFFEX"）。
+        f = T.CThostFtdcQryInstrumentField()
+        prod = str(self.order.get("product", "")).strip()
+        exch = str(self.order.get("exchange_id", "")).strip()
+        if exch:
+            f.ExchangeID = exch
+        if prod:
+            f.InstrumentID = prod  # CTP 支持按合约代码模糊匹配；下面再用前缀过滤
+        _log(f"query instruments product={prod} exchange={exch}")
+        self.state["instruments"] = []
+        self.api.ReqQryInstrument(f, self._nrid())
+
+    def OnRspQryInstrument(self, p, info, n, last):
+        if p is not None:
+            try:
+                prod = str(self.order.get("product", "")).strip().upper()
+                iid = str(getattr(p, "InstrumentID", "") or "")
+                base = iid
+                # 只保留字母前缀匹配 product 的合约（如 IC 开头）
+                import re as _re
+                m = _re.match(r"^([A-Za-z]+)([0-9]+)$", iid)
+                ok = True
+                if prod:
+                    ok = bool(m) and m.group(1).upper() == prod
+                if ok and iid:
+                    self.state["instruments"].append({
+                        "instrument_id": iid,
+                        "exchange_id": str(getattr(p, "ExchangeID", "") or ""),
+                        "product_id": str(getattr(p, "ProductID", "") or ""),
+                        "name": str(getattr(p, "InstrumentName", "") or ""),
+                        "volume_multiple": int(float(getattr(p, "VolumeMultiple", 0) or 0)),
+                        "price_tick": _num(p, "PriceTick"),
+                        "expire_date": str(getattr(p, "ExpireDate", "") or ""),
+                        "open_date": str(getattr(p, "OpenDate", "") or ""),
+                        "is_trading": int(getattr(p, "IsTrading", 0) or 0),
+                    })
+            except Exception as e:  # noqa: BLE001
+                _log(f"instrument parse fail: {type(e).__name__}: {e}")
+        if last:
+            self._instr_done = True
+            _log(f"instruments done: {len(self.state['instruments'])}")
 
     def _rsp_info(self, info):
         if info is None:
@@ -431,7 +546,7 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0)
                       "account": None, "positions": [], "logined": False,
                       "settled": False, "acct_done": False, "pos_done": False,
                       "front_id": 0, "session_id": 0,
-                      "order_events": [], "trade_events": [],
+                      "order_events": [], "trade_events": [], "instruments": [], "orders": [],
                       "action_done": False, "action_result": None, "order_ref": ""}
 
     api = T.CThostFtdcTraderApi.CreateFtdcTraderApi("")
@@ -457,6 +572,9 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0)
             if action_deadline is not None and time.time() > action_deadline:
                 _log(f"action wait timeout ({action_wait}s) -> return current result")
                 break
+        elif action == "instruments":
+            if spi._instr_done:
+                break
         else:
             if state["logined"] and state["pos_done"]:
                 break
@@ -478,12 +596,26 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0)
         "positions": state["positions"],
         "front_id": state["front_id"], "session_id": state["session_id"],
     }
+    if action == "instruments":
+        insts = state.get("instruments", [])
+        tradable = [x for x in insts if x.get("is_trading")] or insts
+        # 主力合约：可交易中按 expire_date 最近（次近月通常即主力的简单启发；
+        # 真实主力按持仓量，需行情/持仓查询——这里给出可交易月份列表供上层选择）。
+        out["instruments"] = insts
+        out["tradable_count"] = len(tradable)
+        # 选“最近到期且可交易”的月份作为默认主力候选
+        future = sorted(tradable, key=lambda x: (x.get("expire_date") or "99999999"))
+        out["front_contract"] = future[0] if future else None
+        out["status"] = "instruments"
+        out["ok"] = bool(insts)
+        return out
     if action in ("order", "cancel"):
         r = state.get("action_result") or {}
         out["action"] = action
         out["action_result"] = r
         out["order_events"] = state["order_events"]
         out["trade_events"] = state["trade_events"]
+        out["orders"] = state.get("orders", [])
         # 报单/撤单以柜台回报为准；挂单成功（accepted/partial/filled/canceled）即 ok
         out["ok"] = bool(r.get("ok"))
         out["status"] = r.get("status", "no_report")

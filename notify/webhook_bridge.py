@@ -2660,6 +2660,51 @@ def api_ctp_cancel():
     return jsonify(res), code
 
 
+@app.route("/api/ctp/instruments", methods=["GET"])
+def api_ctp_instruments():
+    """
+    GET /api/ctp/instruments?product=IC&exchange=CFFEX
+    查询某品种（字母前缀）在柜台的全部可交易合约月份（含乘数/tick/到期日）。
+    走子进程 worker（原生隔离）。
+    """
+    product = (request.args.get("product", "") or "").strip()
+    exchange = (request.args.get("exchange", "") or "").strip()
+    if not product:
+        return jsonify({"ok": False, "error": "缺少 product（品种字母代码，如 IC/IF/AU）"}), 400
+    ok, res = _ctp_run_action("instruments",
+                              {"product": product, "exchange_id": exchange},
+                              timeout=40.0)
+    code = 200 if ok else (503 if res.get("status") in ("timeout", "crashed", "disabled") else 400)
+    return jsonify(res), code
+
+
+@app.route("/api/ctp/main-contract", methods=["GET"])
+def api_ctp_main_contract():
+    """
+    GET /api/ctp/main-contract?product=IC&exchange=CFFEX
+    返回该品种的近月可交易合约（前端可直接用作 instrument_id 报单）。
+    注意：真实"主力"按持仓量最大判定，需行情 OI；此处返回最近到期可交易合约
+    作为默认候选，并附全部月份供上层按持仓量选择。
+    """
+    product = (request.args.get("product", "") or "").strip()
+    exchange = (request.args.get("exchange", "") or "").strip()
+    if not product:
+        return jsonify({"ok": False, "error": "缺少 product（如 IC）"}), 400
+    ok, res = _ctp_run_action("instruments",
+                              {"product": product, "exchange_id": exchange},
+                              timeout=40.0)
+    if not ok:
+        code = 503 if res.get("status") in ("timeout", "crashed", "disabled") else 400
+        return jsonify(res), code
+    return jsonify({
+        "ok": True, "product": product.upper(),
+        "exchange": exchange.upper() or None,
+        "front_contract": res.get("front_contract"),
+        "instruments": res.get("instruments", []),
+        "tradable_count": res.get("tradable_count", 0),
+    }), 200
+
+
 @app.route("/api/okx/account", methods=["GET"])
 def api_okx_account():
     """GET /api/okx/account — OKX 账户余额与净值。"""
