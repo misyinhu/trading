@@ -964,8 +964,20 @@ def _extract_tv_indicators(studies):
     return result
 
 
-# Z-Score 监控配置
-_ZSCORE_SIGNAL_THRESHOLD = 2.0   # |Z| > 2.0 时触发信号
+# Z-Score 监控配置（从 settings.yaml 读取 risk_gate.zscore_alert）
+def _get_zscore_signal_threshold() -> float:
+    """从 risk_gate.zscore_alert 读取，fallback 1.0（与入口阈值一致）。"""
+    try:
+        with open(
+            Path(PROJECT_ROOT) / "config" / "settings.yaml",
+            encoding="utf-8",
+        ) as f:
+            cfg = yaml.safe_load(f) or {}
+        return (cfg.get("risk_gate", {}).get("zscore_alert", 1.0)) or 1.0
+    except Exception:
+        return 1.0
+
+_ZSCORE_SIGNAL_THRESHOLD: float = _get_zscore_signal_threshold()
 _ZSCORE_SENT_CACHE: dict = {}    # {(study_name, direction): last_signal_time}
 
 
@@ -2569,6 +2581,159 @@ def _get_simnow_trader(timeout: float = 10.0):
     if not trader.is_connected():
         trader.connect(timeout=timeout)
     return trader
+
+
+# ── 掘金量化(gm) 模拟交易：子进程隔离（gm_env venv，走本地掘金终端服务）──
+_GM_CACHE = {"ts": 0.0, "data": None}
+_GM_CACHE_LOCK = threading.Lock()
+_GM_CACHE_TTL = 20.0
+
+
+def _gm_credentials() -> dict:
+    """掘金 token/账户/终端地址：环境变量优先，回退 .streamlit/secrets.toml。"""
+    cred = {"token": os.environ.get("GM_TOKEN", ""),
+            "account": os.environ.get("GM_ACCOUNT", ""),
+            "addr": os.environ.get("GM_SERV_ADDR", "localhost:7001")}
+    if not cred["token"]:
+        try:
+            import tomllib
+            secp = Path(PROJECT_ROOT) / ".streamlit" / "secrets.toml"
+            if secp.exists():
+                sec = tomllib.load(open(secp, "rb"))
+                cred["token"] = cred["token"] or sec.get("GM_TOKEN", "")
+                cred["account"] = cred["account"] or sec.get("GM_ACCOUNT", "")
+                cred["addr"] = os.environ.get("GM_SERV_ADDR") or sec.get("GM_SERV_ADDR", "localhost:7001")
+        except Exception:  # noqa: BLE001
+            pass
+    return cred
+
+
+def _gm_enabled() -> bool:
+    return bool(_gm_credentials()["token"])
+
+
+def _gm_run(action: str, order: dict | None = None, timeout: float = 45.0,
+            force: bool = False):
+    """在 gm_env 子进程跑掘金策略框架，返回 (ok, payload)。
+
+    gm SDK 原生层与 run() 框架必须在独立进程；结果经临时文件回传
+    （gm C sdk 会接管 stdout，print 不可靠）。
+    """
+    if not _gm_enabled():
+        return False, {"ok": False, "status": "disabled",
+                       "error": "掘金未配置（secrets.toml 缺 GM_TOKEN/GM_ACCOUNT）"}
+    if action in ("account", "positions") and not force:
+        with _GM_CACHE_LOCK:
+            if _GM_CACHE["data"] is not None and time.time() - _GM_CACHE["ts"] < _GM_CACHE_TTL:
+                d = _GM_CACHE["data"]
+                return bool(d.get("ok")), d
+
+    import tempfile
+    gm_py = os.environ.get("GM_PYTHON", r"C:\projects\gm_env\Scripts\python.exe")
+    gm_dir = os.environ.get("GM_ENV_DIR", r"C:\projects\gm_env")
+    rf = tempfile.NamedTemporaryFile(delete=False, suffix=".json",
+                                     prefix="gm_res_", dir=gm_dir if os.path.isdir(gm_dir) else None)
+    rf.close()
+    res_path = rf.name.replace("\\", "/")
+    driver = (
+        "import os,sys; "
+        f"sys.path.insert(0, r'{gm_dir}'); "
+        "from gm.api import run, set_token, set_serv_addr; "
+        "set_token(os.environ['GM_TOKEN']); set_serv_addr(os.environ['GM_SERV_ADDR']); "
+        "run(strategy_id='', filename='gmsim_worker', mode=1, "
+        "token=os.environ['GM_TOKEN'], serv_addr=os.environ['GM_SERV_ADDR'])"
+    )
+    env = dict(os.environ)
+    cred = _gm_credentials()
+    env["GM_TOKEN"] = cred["token"]
+    env["GM_ACCOUNT"] = cred["account"]
+    env["GM_SERV_ADDR"] = cred["addr"]
+    env["GM_ACTION"] = action
+    env["GM_ORDER_JSON"] = json.dumps(order or {}, ensure_ascii=False)
+    env["GM_RESULT_FILE"] = res_path
+    try:
+        proc = subprocess.run([gm_py, "-u", "-c", driver],
+                              cwd=gm_dir, capture_output=True, text=True,
+                              timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return False, {"ok": False, "status": "timeout", "error": f"gm 子进程超时（{timeout}s）"}
+    except Exception as e:  # noqa: BLE001
+        return False, {"ok": False, "status": "error", "error": f"启动 gm 子进程失败: {e}"}
+    result = None
+    try:
+        txt = open(res_path, encoding="utf-8").read().strip()
+        if txt.startswith("RESULT_JSON="):
+            result = json.loads(txt[len("RESULT_JSON="):])
+    except Exception:  # noqa: BLE001
+        result = None
+    finally:
+        try:
+            os.remove(res_path)
+        except OSError:
+            pass
+    if result is None:
+        tail = (proc.stderr or "").strip().splitlines()
+        tail = [t for t in tail if "Error" in t or "error" in t][-3:]
+        return False, {"ok": False, "status": "crashed",
+                       "error": f"gm 子进程无结果（exit={proc.returncode}）" +
+                                (f"；{ ' | '.join(tail)}" if tail else "")}
+    if action in ("account", "positions"):
+        with _GM_CACHE_LOCK:
+            _GM_CACHE["ts"] = time.time()
+            _GM_CACHE["data"] = result
+    return bool(result.get("ok")), result
+
+
+@app.route("/api/gm/account", methods=["GET"])
+def api_gm_account():
+    """GET /api/gm/account[?force=1] — 掘金模拟账户资金（走本地掘金终端）。"""
+    force = request.args.get("force") in ("1", "true", "yes")
+    ok, res = _gm_run("account", force=force)
+    if not ok:
+        code = 503 if res.get("status") in ("timeout", "crashed", "disabled") else 500
+        return jsonify(res), code
+    return jsonify({"account": res.get("account"), "status": res.get("status"),
+                    "channel": "gm"})
+
+
+@app.route("/api/gm/positions", methods=["GET"])
+def api_gm_positions():
+    """GET /api/gm/positions[?force=1] — 掘金模拟账户持仓。"""
+    force = request.args.get("force") in ("1", "true", "yes")
+    ok, res = _gm_run("positions", force=force)
+    if not ok:
+        code = 503 if res.get("status") in ("timeout", "crashed", "disabled") else 500
+        return jsonify(res), code
+    return jsonify({"positions": res.get("positions", []),
+                    "count": res.get("count", 0), "status": res.get("status"),
+                    "channel": "gm"})
+
+
+@app.route("/api/gm/order", methods=["POST"])
+def api_gm_order():
+    """
+    POST /api/gm/order — 掘金模拟 A 股/期货下单。
+    Body: {"symbol":"SHSE.600000","side":1,"volume":100,"order_type":1,
+           "position_effect":1,"price":10.5}
+    side: 1 买 / 2 卖；order_type: 1 限价 / 2 市价；position_effect: 1 开 / 2 平。
+    """
+    body = request.get_json(silent=True) or {}
+    if not body.get("symbol"):
+        return jsonify({"ok": False, "error": "缺少 symbol（如 SHSE.600000）"}), 400
+    if int(float(body.get("volume", 0) or 0)) <= 0:
+        return jsonify({"ok": False, "error": "volume 必须为正数（A股≥100股）"}), 400
+    ok, res = _gm_run("order", body, timeout=45.0)
+    code = 200 if ok else (503 if res.get("status") in ("timeout", "crashed", "disabled") else 400)
+    return jsonify(res), code
+
+
+@app.route("/api/gm/cancel", methods=["POST"])
+def api_gm_cancel():
+    """POST /api/gm/cancel — 撤未成交委托。Body: {"symbol":"SHSE.600000"}（省略撤全部）。"""
+    body = request.get_json(silent=True) or {}
+    ok, res = _gm_run("cancel", body, timeout=45.0)
+    code = 200 if ok else (503 if res.get("status") in ("timeout", "crashed", "disabled") else 400)
+    return jsonify(res), code
 
 
 @app.route("/api/ctp/account", methods=["GET"])
