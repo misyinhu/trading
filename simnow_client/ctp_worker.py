@@ -98,13 +98,17 @@ def _num(p, *names):
 class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
     """交易 SPI 回调（模块级类，CTP 工作线程驱动）。"""
 
-    def __init__(self, api, cfg, state):
+    def __init__(self, api, cfg, state, action="query", order=None):
         if T is not None:
             super().__init__()
         self.api = api
         self.cfg = cfg
         self.state = state
+        self.action = action              # query / order / cancel
+        self.order = order or {}
         self._rid = 100
+        self._order_ref = ""
+        self._settled_fired = False
 
     def _nrid(self):
         self._rid += 1
@@ -154,6 +158,8 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             _log(f"login ok user={inv} trading_day={getattr(p,'TradingDay',None)} -> settlement confirm")
             self.state["investor"] = inv
             self.state["trading_day"] = getattr(p, "TradingDay", "")
+            self.state["front_id"] = int(getattr(p, "FrontID", 0) or 0)
+            self.state["session_id"] = int(getattr(p, "SessionID", 0) or 0)
             self.state["logined"] = True
             sc = T.CThostFtdcSettlementInfoConfirmField()
             sc.BrokerID = self.cfg["broker_id"]
@@ -170,7 +176,20 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             _log(f"settlement confirm [{err}] {getattr(info,'ErrorMsg','')}（继续尝试查询）")
         else:
             self.state["settled"] = True
-            _log("settlement confirmed -> query account")
+            _log("settlement confirmed")
+        self._settled_fired = True
+        if self.action in ("order", "cancel"):
+            try:
+                if self.action == "order":
+                    self._do_order()
+                else:
+                    self._do_cancel()
+            except Exception as e:  # noqa: BLE001
+                _log(f"action submit error: {type(e).__name__}: {e}")
+                self.state["action_done"] = True
+                self.state["action_result"] = {"ok": False, "error": f"submit error: {e}"}
+            return
+        _log("settlement confirmed -> query account")
         q = T.CThostFtdcQryTradingAccountField()
         q.BrokerID = self.cfg["broker_id"]
         q.InvestorID = self.state["investor"]
@@ -217,6 +236,180 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             self.state["pos_done"] = True
             _log(f"positions done: {len(self.state['positions'])}")
 
+    # ── 报单 / 撤单 ──────────────────────────────────────────────
+    def _gen_order_ref(self) -> str:
+        ref = f"{int(time.time() * 1000) % 100000000:08d}"
+        self._order_ref = ref
+        return ref
+
+    def _do_order(self):
+        o = self.order
+        ref = self._gen_order_ref()
+        f = T.CThostFtdcInputOrderField()
+        f.BrokerID = self.cfg["broker_id"]
+        f.InvestorID = self.state["investor"]
+        f.UserID = self.cfg["user"]
+        f.InstrumentID = str(o["instrument_id"])
+        f.ExchangeID = str(o.get("exchange_id", ""))
+        f.OrderRef = ref
+        f.LimitPrice = float(o.get("price", 0.0))
+        f.VolumeTotalOriginal = int(float(o.get("volume", 1)))
+        f.Direction = str(o.get("direction", "0"))          # 0 买 / 1 卖
+        f.CombOffsetFlag = str(o.get("offset_flag", "0"))   # 0 开 / 1 平 / 3 平今 / 4 平昨
+        f.CombHedgeFlag = str(o.get("hedge_flag", "1"))     # 1 投机
+        f.OrderPriceType = str(o.get("price_type", "2"))   # 2 限价 / 1 市价
+        f.TimeCondition = "3"                               # GFD
+        f.VolumeCondition = "1"                             # 任意数量
+        f.MinVolume = 1
+        f.ContingentCondition = "1"
+        f.ForceCloseReason = "0"
+        self.state["order_ref"] = ref
+        self.state["action_result"] = {"ok": False, "order_ref": ref,
+                                       "instrument_id": f.InstrumentID,
+                                       "exchange_id": f.ExchangeID}
+        _log(f"insert order ref={ref} {f.InstrumentID} dir={f.Direction} "
+             f"off={f.CombOffsetFlag} px={f.LimitPrice} vol={f.VolumeTotalOriginal}")
+        rc = self.api.ReqOrderInsert(f, self._nrid())
+        if rc != 0:
+            self.state["action_done"] = True
+            self.state["action_result"] = {"ok": False, "order_ref": ref,
+                                           "error": f"ReqOrderInsert ret={rc}"}
+
+    def _do_cancel(self):
+        o = self.order
+        f = T.CThostFtdcInputOrderActionField()
+        f.BrokerID = self.cfg["broker_id"]
+        f.InvestorID = self.state["investor"]
+        f.UserID = self.cfg["user"]
+        f.InstrumentID = str(o["instrument_id"])
+        f.ExchangeID = str(o.get("exchange_id", ""))
+        f.ActionFlag = "0"  # 撤单
+        sysid = str(o.get("order_sys_id", "") or "")
+        if sysid:
+            # 跨会话撤单：优先用交易所系统号
+            f.OrderSysID = sysid
+        else:
+            f.FrontID = int(o.get("front_id", self.state.get("front_id", 0)))
+            f.SessionID = int(o.get("session_id", self.state.get("session_id", 0)))
+            f.OrderRef = str(o["order_ref"])
+        self.state["action_result"] = {"ok": False, "cancel_for": o.get("order_ref") or sysid,
+                                       "instrument_id": f.InstrumentID}
+        _log(f"cancel order ref={o.get('order_ref')} sysid={sysid} {f.InstrumentID}")
+        rc = self.api.ReqOrderAction(f, self._nrid())
+        if rc != 0:
+            self.state["action_done"] = True
+            self.state["action_result"] = {"ok": False,
+                                           "error": f"ReqOrderAction ret={rc}"}
+
+    def _rsp_info(self, info):
+        if info is None:
+            return 0, ""
+        return getattr(info, "ErrorID", 0) or 0, getattr(info, "ErrorMsg", "") or ""
+
+    def OnRspOrderInsert(self, p, info, n, b):
+        err, msg = self._rsp_info(info)
+        _log(f"OnRspOrderInsert [{err}] {msg}")
+        if err:
+            self.state["action_done"] = True
+            r = self.state.setdefault("action_result", {})
+            r.update({"ok": False, "error": f"order rejected [{err}] {msg}",
+                      "error_id": err})
+
+    def OnErrRtnOrderInsert(self, p, info):
+        err, msg = self._rsp_info(info)
+        _log(f"OnErrRtnOrderInsert [{err}] {msg}")
+        self.state["action_done"] = True
+        r = self.state.setdefault("action_result", {})
+        r.update({"ok": False, "error": f"exchange reject [{err}] {msg}",
+                  "error_id": err})
+
+    def OnRtnOrder(self, p):
+        if p is None:
+            return
+        try:
+            status = str(getattr(p, "OrderStatus", ""))
+            ref = str(getattr(p, "OrderRef", ""))
+            ev = {
+                "order_ref": ref,
+                "order_sys_id": str(getattr(p, "OrderSysID", "") or ""),
+                "status": status,
+                "status_msg": str(getattr(p, "StatusMsg", "") or ""),
+                "instrument_id": str(getattr(p, "InstrumentID", "") or ""),
+                "exchange_id": str(getattr(p, "ExchangeID", "") or ""),
+                "front_id": int(getattr(p, "FrontID", 0) or 0),
+                "session_id": int(getattr(p, "SessionID", 0) or 0),
+                "volume_total": int(float(getattr(p, "VolumeTotal", 0) or 0)),
+                "volume_traded": int(float(getattr(p, "VolumeTraded", 0) or 0)),
+                "limit_price": _num(p, "LimitPrice"),
+            }
+            self.state["order_events"].append(ev)
+            _log(f"OnRtnOrder ref={ref} status={status} traded={ev['volume_traded']}/{ev['volume_total']} sysid={ev['order_sys_id']}")
+            r = self.state.setdefault("action_result", {})
+            if ev.get("status_msg"):
+                r["last_status_msg"] = ev["status_msg"]
+            if self.action == "cancel":
+                if status == "5":  # 已撤
+                    r.update({"ok": True, "status": "canceled", **{k: ev[k] for k in ("order_ref", "order_sys_id", "instrument_id", "exchange_id")}})
+                    self.state["action_done"] = True
+                elif status in ("0", "1"):
+                    r.update({"ok": True, "status": "still_active", "order_status": status})
+            else:
+                r.update({"order_sys_id": ev["order_sys_id"] or r.get("order_sys_id", ""),
+                          "front_id": ev["front_id"], "session_id": ev["session_id"],
+                          "exchange_id": ev["exchange_id"] or r.get("exchange_id", ""),
+                          "order_status": status, "volume_traded": ev["volume_traded"]})
+                if status == "0":  # 全部成交
+                    r.update({"ok": True, "status": "filled"})
+                    self.state["action_done"] = True
+                elif status == "5":  # 已撤/被拒
+                    msg = ev.get("status_msg", "") or ""
+                    if "拒" in msg:
+                        r.update({"ok": False, "status": "rejected",
+                                  "error": msg or "order rejected by exchange"})
+                    else:
+                        r.update({"ok": True, "status": "canceled"})
+                    self.state["action_done"] = True
+                elif status in ("3", "1"):  # 未成交/部分成交（挂单成功）
+                    r.update({"ok": True, "status": "accepted" if status == "3" else "partial"})
+        except Exception as e:  # noqa: BLE001
+            _log(f"OnRtnOrder parse fail: {type(e).__name__}: {e}")
+
+    def OnRtnTrade(self, p):
+        if p is None:
+            return
+        try:
+            tr = {
+                "order_ref": str(getattr(p, "OrderRef", "")),
+                "order_sys_id": str(getattr(p, "OrderSysID", "") or ""),
+                "trade_id": str(getattr(p, "TradeID", "") or ""),
+                "instrument_id": str(getattr(p, "InstrumentID", "") or ""),
+                "direction": str(getattr(p, "Direction", "")),
+                "offset_flag": str(getattr(p, "OffsetFlag", "")),
+                "price": _num(p, "Price"),
+                "volume": int(float(getattr(p, "Volume", 0) or 0)),
+            }
+            self.state["trade_events"].append(tr)
+            _log(f"OnRtnTrade ref={tr['order_ref']} px={tr['price']} vol={tr['volume']}")
+        except Exception as e:  # noqa: BLE001
+            _log(f"OnRtnTrade parse fail: {e}")
+
+    def OnRspOrderAction(self, p, info, n, b):
+        err, msg = self._rsp_info(info)
+        _log(f"OnRspOrderAction [{err}] {msg}")
+        if err:
+            self.state["action_done"] = True
+            r = self.state.setdefault("action_result", {})
+            r.update({"ok": False, "error": f"cancel rejected [{err}] {msg}",
+                      "error_id": err})
+
+    def OnErrRtnOrderAction(self, p, info):
+        err, msg = self._rsp_info(info)
+        _log(f"OnErrRtnOrderAction [{err}] {msg}")
+        self.state["action_done"] = True
+        r = self.state.setdefault("action_result", {})
+        r.update({"ok": False, "error": f"cancel exchange reject [{err}] {msg}",
+                  "error_id": err})
+
     def OnRspError(self, info, n, b):
         err = getattr(info, "ErrorID", None)
         msg = getattr(info, "ErrorMsg", None)
@@ -226,7 +419,7 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             self.state["error"] = f"rsp error [{err}] {msg}"
 
 
-def run(timeout: float = 25.0) -> dict:
+def run(action: str = "query", order: dict | None = None, timeout: float = 30.0) -> dict:
     global _API, _SPI, _STATE
     if not Path(_CTP_SWG_PATH).exists():
         return {"ok": False, "status": "unavailable", "error": f"CTP SWIG not found: {_CTP_SWG_PATH}"}
@@ -236,10 +429,13 @@ def run(timeout: float = 25.0) -> dict:
     cfg = _load_config()
     _STATE = state = {"phase": "init", "error": "", "investor": "", "trading_day": "",
                       "account": None, "positions": [], "logined": False,
-                      "settled": False, "acct_done": False, "pos_done": False}
+                      "settled": False, "acct_done": False, "pos_done": False,
+                      "front_id": 0, "session_id": 0,
+                      "order_events": [], "trade_events": [],
+                      "action_done": False, "action_result": None, "order_ref": ""}
 
     api = T.CThostFtdcTraderApi.CreateFtdcTraderApi("")
-    spi = TraderSpi(api, cfg, state)
+    spi = TraderSpi(api, cfg, state, action=action, order=order)
     _API, _SPI = api, spi
     api.RegisterSpi(spi)
     api.SubscribePrivateTopic(2)
@@ -248,12 +444,23 @@ def run(timeout: float = 25.0) -> dict:
     api.Init()
 
     deadline = time.time() + timeout
+    action_wait = 6.0  # 报单/撤单后额外等待回报的宽限
+    action_deadline = None
     while time.time() < deadline:
         if state["phase"] == "error":
             break
-        if state["logined"] and state["pos_done"]:
-            break
-        time.sleep(0.2)
+        if action in ("order", "cancel"):
+            if state["settled"] and action_deadline is None:
+                action_deadline = time.time() + action_wait
+            if state["action_done"]:
+                break
+            if action_deadline is not None and time.time() > action_deadline:
+                _log(f"action wait timeout ({action_wait}s) -> return current result")
+                break
+        else:
+            if state["logined"] and state["pos_done"]:
+                break
+        time.sleep(0.1)
 
     try:
         api.Release()
@@ -264,17 +471,41 @@ def run(timeout: float = 25.0) -> dict:
         return {"ok": False, "status": "error", "error": state["error"] or "unknown"}
     if not state["logined"]:
         return {"ok": False, "status": "timeout", "error": f"login timeout (phase={state['phase']})"}
-    return {
+    out = {
         "ok": True, "status": "logined",
         "investor": state["investor"], "trading_day": state["trading_day"],
         "settled": state["settled"], "account": state["account"],
         "positions": state["positions"],
+        "front_id": state["front_id"], "session_id": state["session_id"],
     }
+    if action in ("order", "cancel"):
+        r = state.get("action_result") or {}
+        out["action"] = action
+        out["action_result"] = r
+        out["order_events"] = state["order_events"]
+        out["trade_events"] = state["trade_events"]
+        # 报单/撤单以柜台回报为准；挂单成功（accepted/partial/filled/canceled）即 ok
+        out["ok"] = bool(r.get("ok"))
+        out["status"] = r.get("status", "no_report")
+        if not r.get("ok") and not r.get("error"):
+            out["ok"] = False
+    return out
 
 
 if __name__ == "__main__":
+    _action = os.environ.get("CTP_ACTION", "query").strip().lower()
+    _order = {}
+    _oj = os.environ.get("CTP_ORDER_JSON", "").strip()
+    if _oj:
+        try:
+            _order = json.loads(_oj)
+        except Exception as e:  # noqa: BLE001
+            print("RESULT_JSON=" + json.dumps(
+                {"ok": False, "status": "bad_order_json", "error": str(e)},
+                ensure_ascii=False), flush=True)
+            sys.exit(2)
     try:
-        result = run()
+        result = run(action=_action, order=_order)
     except Exception as e:  # noqa: BLE001  # 兜底（原生崩溃不走这里）
         result = {"ok": False, "status": "crash_py", "error": f"{type(e).__name__}: {e}"}
     print("RESULT_JSON=" + json.dumps(result, ensure_ascii=False), flush=True)

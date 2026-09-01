@@ -2516,6 +2516,46 @@ def _ctp_snapshot(force: bool = False, timeout: float = 30.0):
     return bool(result.get("ok")), result
 
 
+def _ctp_run_action(action: str, order: dict, timeout: float = 40.0):
+    """在独立子进程运行 CTP 报单/撤单动作（原生崩溃只杀子进程）。
+
+    返回 (ok: bool, payload: dict)。报单/撤单不走快照缓存。
+    """
+    if not _simnow_enabled():
+        return False, {"ok": False, "status": "disabled",
+                       "error": "SimNow/CTP 原生层未启用（simnow.enabled=false）"}
+    worker = Path(PROJECT_ROOT) / "simnow_client" / "ctp_worker.py"
+    env = dict(os.environ)
+    env["CTP_ACTION"] = action
+    env["CTP_ORDER_JSON"] = json.dumps(order or {}, ensure_ascii=False)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-u", str(worker)],
+            cwd=PROJECT_ROOT, capture_output=True, text=True,
+            timeout=timeout, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return False, {"ok": False, "status": "timeout",
+                       "error": f"CTP 报单子进程超时（{timeout}s）"}
+    except Exception as e:  # noqa: BLE001
+        return False, {"ok": False, "status": "error",
+                       "error": f"启动 CTP 报单子进程失败: {e}"}
+    result = None
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("RESULT_JSON="):
+            try:
+                result = json.loads(line[len("RESULT_JSON="):])
+            except Exception:  # noqa: BLE001
+                result = None
+    if result is None:
+        tail = (proc.stderr or "").strip().splitlines()
+        tail = [t for t in tail if "[ctp]" in t][-4:]
+        return False, {"ok": False, "status": "crashed",
+                       "error": f"CTP 原生子进程异常退出（exit={proc.returncode}）" +
+                                (f"；日志: {' | '.join(tail)}" if tail else "")}
+    return bool(result.get("ok")), result
+
+
 def _get_simnow_trader(timeout: float = 10.0):
     """复用 SimNowTrader 单例，自动连接（超时 timeout 秒）。"""
     # 已废弃进程内直连：CTP SWIG 原生层在某些认证回调上会进程级崩溃，
@@ -2565,6 +2605,58 @@ def api_ctp_positions():
     positions = snap.get("positions", [])
     return jsonify({"positions": positions, "count": len(positions),
                     "status": snap.get("status")})
+
+
+@app.route("/api/ctp/order", methods=["POST"])
+def api_ctp_order():
+    """
+    POST /api/ctp/order — SimNow 期货报单（限价）。
+    Body: {
+      "instrument_id": "rb2410",        # 必填，合约代码
+      "exchange_id": "SHFE",            # 推荐填，柜台路由
+      "direction": "0",                 # 0 买 / 1 卖
+      "offset_flag": "0",               # 0 开仓 / 1 平仓 / 3 平今 / 4 平昨
+      "price": 3500.0,                  # 限价（price_type=2 时必填）
+      "volume": 1,                      # 手数
+      "price_type": "2",                # 2 限价（默认）/ 1 市价
+      "hedge_flag": "1"                 # 1 投机（默认）
+    }
+    """
+    body = request.get_json(silent=True) or {}
+    required = ["instrument_id"]
+    missing = [k for k in required if not body.get(k)]
+    if missing:
+        return jsonify({"ok": False, "error": f"缺少必填字段: {missing}"}), 400
+    if str(body.get("price_type", "2")) == "2" and not float(body.get("price", 0) or 0) > 0:
+        return jsonify({"ok": False, "error": "限价单必须提供 price>0"}), 400
+    if int(float(body.get("volume", 0) or 0)) <= 0:
+        return jsonify({"ok": False, "error": "volume 必须为正整数"}), 400
+    ok, res = _ctp_run_action("order", body)
+    code = 200 if ok else (503 if res.get("status") in ("timeout", "crashed", "disabled") else 400)
+    return jsonify(res), code
+
+
+@app.route("/api/ctp/cancel", methods=["POST"])
+def api_ctp_cancel():
+    """
+    POST /api/ctp/cancel — SimNow 期货撤单。
+    Body 二选一：
+      A) {"order_sys_id": "...", "exchange_id": "SHFE", "instrument_id": "rb2410"}
+      B) {"order_ref": "12345", "front_id": 1, "session_id": -123,
+          "exchange_id": "SHFE", "instrument_id": "rb2410"}
+    order_sys_id 方式跨会话更稳（推荐用报单返回的 order_sys_id）。
+    """
+    body = request.get_json(silent=True) or {}
+    if not body.get("instrument_id"):
+        return jsonify({"ok": False, "error": "缺少 instrument_id"}), 400
+    has_sysid = bool(body.get("order_sys_id"))
+    has_ref = bool(body.get("order_ref"))
+    if not (has_sysid or has_ref):
+        return jsonify({"ok": False,
+                        "error": "需提供 order_sys_id（推荐）或 order_ref(+front_id/session_id)"}), 400
+    ok, res = _ctp_run_action("cancel", body)
+    code = 200 if ok else (503 if res.get("status") in ("timeout", "crashed", "disabled") else 400)
+    return jsonify(res), code
 
 
 @app.route("/api/okx/account", methods=["GET"])
