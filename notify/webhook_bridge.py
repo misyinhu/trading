@@ -7,9 +7,11 @@ TradingView Webhook -> 飞书 中转服务
 import os
 import sys
 
-# 设置代理（必须在OKX SDK导入之前）
-os.environ["HTTP_PROXY"] = "http://127.0.0.1:7890"
-os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
+# 直连，不使用代理
+os.environ.pop("HTTP_PROXY", None)
+os.environ.pop("HTTPS_PROXY", None)
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
 
 # 首先应用 nest_asyncio patch（必须在导入 ib_insync 之前）
 try:
@@ -30,7 +32,9 @@ import requests
 import yaml
 
 # 添加配置路径
-PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+# 绝对路径：以 `python notify\webhook_bridge.py` 相对方式启动时 __file__ 非绝对，
+# 用 abspath 保证无论当前工作目录在哪都能定位 config/、simnow_client/ 等资源。
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 from config import (
     load_config,
@@ -40,6 +44,7 @@ from config import (
     get_project_root,
 )
 from client.ib_connection import get_ib_connection, get_ib_manager
+from ib_insync import Contract
 from notify.nl_parser import parse_trading_command
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -59,9 +64,11 @@ def _submit_order_in_background(
     conId=None,
     close_position=False,
     outside_rth=None,
+    signal_id: str = "",
 ):
     """在后台提交订单，避免阻塞主线程。
 
+    所有 IB 下单统一走 OrderManager.place() → RiskGate (advisory 模式)。
     对于期货（FUT）默认启用 outsideRth=True，允许盘前/盘后交易。
     """
     # 期货默认启用盘前交易
@@ -70,19 +77,35 @@ def _submit_order_in_background(
 
     def _order_job():
         try:
-            from orders.place_order_func import place_order
+            from orders.order_manager import OrderManager
+            from orders.risk_gate import OrderContext, GateMode
 
-            return place_order(
-                ib,
-                symbol,
-                action,
-                quantity,
-                exchange=exchange,
-                sec_type=sec_type,
+            mgr = OrderManager()
+            ctx = OrderContext(
+                symbol=symbol,
+                action=action,
+                quantity=float(quantity),
+                exchange="IB",
+                sec_type=sec_type or "",
                 conId=conId,
                 close_position=close_position,
                 outside_rth=outside_rth,
+                signal_id=signal_id,
             )
+            result = mgr.place(ctx, gate_mode=GateMode.ADVISORY)
+            # 成交后回写需要 orderId → signal_id 映射
+            if result.order_id and signal_id:
+                try:
+                    _order_to_signal[int(result.order_id)] = signal_id
+                except (ValueError, TypeError):
+                    pass
+            return {
+                "status": result.status,
+                "orderId": result.order_id,
+                "filled": result.filled,
+                "message": result.message,
+                "risk_warnings": result.risk_warnings,
+            }
         except Exception as e:
             print(f"[FEISHU] Background order error: {e}", file=sys.stderr)
             return {"error": str(e)}
@@ -92,6 +115,7 @@ def _submit_order_in_background(
 
 # ============ execDetails 回调 - 成交实时通知 ============
 _fill_notified = set()  # 已通知的 execId，避免重复
+_order_to_signal: dict[int, str] = {}  # orderId → signal_id（ORDER_FILLED 回写用）
 
 
 def _on_exec_details(trade, fill):
@@ -156,6 +180,22 @@ def _on_exec_details(trade, fill):
 
         _debug(f"[FILL] {msg}")
         send_feishu(msg, FEISHU_CONVERSATION_ID)
+    # ── 回写 quant-agent（ORDER_FILLED 事件）───────────────────────────
+        from notify.event_writer import write_event_callback
+        sig_id = _order_to_signal.get(order_id, None)
+        if sig_id:
+            fill_data = {
+                "symbol": symbol,
+                "exchange": exchange,
+                "action": side,
+                "quantity": qty,
+                "avg_price": avg_price,
+                "commission": commission,
+                "realized_pnl": realized_pnl,
+                "order_id": order_id,
+            }
+            write_event_callback(sig_id, "ORDER_FILLED", fill_data, agent="trading")
+            _debug(f"[FILL] quant-agent callback: sig={sig_id} pnl={realized_pnl}")
     except Exception as e:
         _debug(f"[FILL] callback error: {e}")
 
@@ -248,6 +288,26 @@ FEISHU_CONVERSATION_ID = feishu_config.get("chat_id", "")
 
 # 仅查询模式
 QUERY_ONLY = is_query_only()
+
+def _simnow_enabled() -> bool:
+    """CTP/SimNow 原生层开关。
+
+    CTP 走 SWIG 原生 .pyd（仅 cp313），其登录/查询在某些柜台回报下会触发
+    进程级原生崩溃（无 Python 栈、无法 try/except），一旦在 Flask 进程内
+    触发会带走整个桥接服务。因此默认关闭，待子进程隔离/有效账号就绪后再
+    通过 settings.yaml `simnow.enabled: true` 或环境变量 SIMNOW_ENABLED=1 打开。
+    """
+    env = os.environ.get("SIMNOW_ENABLED", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    try:
+        with open(Path(PROJECT_ROOT) / "config" / "settings.yaml", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return bool((data.get("simnow") or {}).get("enabled", False))
+    except Exception:
+        return False
 
 _token_cache = {"token": None, "expire": 0}
 
@@ -856,16 +916,126 @@ def _get_corr_color(corr):
 
 
 def _extract_tv_indicators(studies):
-    """从 TradingView studies 中提取指标值"""
+    """从 TradingView studies 中提取指标值（新格式：_data._items）。
+
+    新格式每条 study 返回:
+        name, barCount, last5, last, fullArray
+    - "Index Z-Score & Spread(XCU XAU)":
+        fullArray = [time, zscore, signal, upper, lower, spread, ...]
+    - "澳银劈叉":
+        fullArray = [time, correlation, stdDev?, ...]
+
+    兼容旧格式（study.values 是 dict）的遗留调用。
+    """
     result = {}
     for study in studies:
-        name = study.get("name", "")
-        if name == "Overlay":
+        name = study.get("name", "") or ""
+        if not name or name == "Overlay":
             continue
+
+        full = study.get("fullArray") or study.get("last") or []
+        last5 = study.get("last5") or []
+
+        if isinstance(full, list) and len(full) >= 2:
+            time_col = full[0]
+
+            # Z-Score & Spread study: [time, zscore, signal, upper, lower, spread, ...]
+            if "Z-Score" in name or "Spread" in name or "z-score" in name.lower():
+                result["Z-Score"] = full[1] if isinstance(full[1], (int, float)) else None
+                result["Z-Score_Signal"] = full[2] if len(full) > 2 and isinstance(full[2], (int, float)) else None
+                result["Z-Score_Upper"] = full[3] if len(full) > 3 and isinstance(full[3], (int, float)) else None
+                result["Z-Score_Lower"] = full[4] if len(full) > 4 and isinstance(full[4], (int, float)) else None
+                result["Spread"] = full[5] if len(full) > 5 and isinstance(full[5], (int, float)) else None
+                # Keep raw full array for reference
+                result["_zscore_full"] = full
+
+            # Correlation study (澳银劈叉)
+            if "劈叉" in name or "corr" in name.lower() or "correlation" in name.lower():
+                result["相关性"] = full[1] if len(full) > 1 and isinstance(full[1], (int, float)) else None
+                result["_corr_full"] = full
+
+        # 旧格式兼容（study.values 是 dict）
         values = study.get("values", {})
-        for k, v in values.items():
-            result[k] = v
+        if isinstance(values, dict):
+            for k, v in values.items():
+                if k not in result:
+                    result[k] = v
+
     return result
+
+
+# Z-Score 监控配置
+_ZSCORE_SIGNAL_THRESHOLD = 2.0   # |Z| > 2.0 时触发信号
+_ZSCORE_SENT_CACHE: dict = {}    # {(study_name, direction): last_signal_time}
+
+
+def _check_zscore_signal(study_name: str, zscore: float, spread: float,
+                         symbol: str, tf: str, quote_close: float) -> dict | None:
+    """检查 Z-Score 是否触发信号，返回信号 dict 或 None。"""
+    if zscore is None:
+        return None
+
+    import time
+    now = time.time()
+
+    # 同品种同方向信号 30 分钟内不重复发送
+    cache_key = (study_name, zscore > 0 and "long" or "short")
+    last_sent = _ZSCORE_SENT_CACHE.get(cache_key, 0)
+    if now - last_sent < 1800:
+        return None
+
+    direction = None
+    if zscore <= -_ZSCORE_SIGNAL_THRESHOLD:
+        direction = "long"
+    elif zscore >= _ZSCORE_SIGNAL_THRESHOLD:
+        direction = "short"
+
+    if direction is None:
+        return None
+
+    _ZSCORE_SENT_CACHE[cache_key] = now
+
+    return {
+        "direction": direction,
+        "symbol": symbol,
+        "study": study_name,
+        "timeframe": tf,
+        "zscore": round(zscore, 4),
+        "spread": round(spread, 4) if spread is not None else None,
+        "quote_close": round(quote_close, 4) if quote_close else None,
+        "reason": f"Z-Score {zscore:.2f} crosses {'-' if direction=='long' else '+'}{_ZSCORE_SIGNAL_THRESHOLD} ({tf})",
+    }
+
+
+def _submit_zscore_signal(signal: dict):
+    """提交 Z-Score 信号到 /api/signals（后台，不阻塞报告）。"""
+    _order_executor.submit(_do_submit_zscore_signal, signal)
+
+
+def _do_submit_zscore_signal(signal: dict):
+    """实际执行信号提交（后台线程）。"""
+    try:
+        import requests
+        url = f"http://127.0.0.1:{get_webhook_port()}/api/signals"
+        payload = {
+            "source": "tv-zscore-monitor",
+            "symbol": signal["symbol"],
+            "direction": signal["direction"],
+            "quantity": 1,
+            "strategy": "zscore-spread",
+            "reason": signal["reason"],
+            "zscore": signal["zscore"],
+            "spread": signal.get("spread"),
+            "timeframe": signal.get("timeframe"),
+            "auto": False,   # 始终半自动，等飞书确认
+        }
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code in (200, 201):
+            print(f"[Z-Score Signal] Submitted: {signal['direction']} {signal['symbol']} z={signal['zscore']}")
+        else:
+            print(f"[Z-Score Signal] Failed {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[Z-Score Signal] Error: {e}")
 
 
 def _format_tv_symbol_report(symbol, data_map):
@@ -894,24 +1064,26 @@ def _format_tv_symbol_report(symbol, data_map):
         indicators = tf_data.get("indicators", {})
 
         zscore = _parse_tv_float(indicators.get("Z-Score"))
-        long_corr = _parse_tv_float(indicators.get("长期相关性"))
-        short_corr = _parse_tv_float(indicators.get("短期相关性"))
+        spread = _parse_tv_float(indicators.get("Spread"))
+        # 澳银劈叉 study → "相关性"；旧 study 格式 → "长期相关性"/"短期相关性"
+        corr = (
+            _parse_tv_float(indicators.get("相关性"))
+            or _parse_tv_float(indicators.get("长期相关性"))
+        )
 
         z_color = _get_zscore_color(zscore)
-        lc_color = _get_corr_color(long_corr)
-        sc_color = _get_corr_color(short_corr)
+        c_color = _get_corr_color(corr)
 
         z_str = f"{zscore:.2f}" if zscore is not None else "N/A"
-        lc_str = f"{long_corr:.2f}" if long_corr is not None else "N/A"
-        sc_str = f"{short_corr:.2f}" if short_corr is not None else "N/A"
+        sp_str = f"{spread:.4f}" if spread is not None else "N/A"
+        c_str = f"{corr:.3f}" if corr is not None else "N/A"
 
         z_display = f"{z_color}{z_str}" if z_color else z_str
-        lc_display = f"{lc_color}{lc_str}" if lc_color else lc_str
-        sc_display = f"{sc_color}{sc_str}" if sc_color else sc_str
+        c_display = f"{c_color}{c_str}" if c_color else c_str
 
         tf_label = {"15m": "M15", "5m": "M5", "1m": "M1"}.get(tf, tf)
         lines.append(
-            f"📊 {tf_label} | Z: {z_display} | 长相关: {lc_display} | 短相关: {sc_display}"
+            f"📊 {tf_label} | Z: {z_display} | Spread: {sp_str} | Corr: {c_display}"
         )
 
     return "\n".join(lines)
@@ -920,6 +1092,7 @@ def _format_tv_symbol_report(symbol, data_map):
 def run_tv_cross_timeframe_analysis():
     """运行 TradingView 跨周期分析（从 CDP 读取）"""
     try:
+        print("[TV-ANALYSIS] Starting...")
         # 添加 kanban 路径以复用 tv.py
         kanban_path = Path(PROJECT_ROOT) / "kanban"
         if str(kanban_path) not in sys.path:
@@ -938,24 +1111,48 @@ def run_tv_cross_timeframe_analysis():
             and not data_m5.get("tabs")
             and not data_m1.get("tabs")
         ):
+            print("[TV-ANALYSIS] No data from any timeframe")
             return "⚠️ 未获取到任何图表数据，请检查 TradingView CDP 连接"
+
+        print(f"[TV-ANALYSIS] data_m15 tabs={len(data_m15.get('tabs', []))} data_m5 tabs={len(data_m5.get('tabs', []))} data_m1 tabs={len(data_m1.get('tabs', []))}")
 
         # 按品种聚合数据
         symbol_map = {}
+        zscore_signals = []
 
         for data, tf_key in [(data_m15, "15m"), (data_m5, "5m"), (data_m1, "1m")]:
             for tab in data.get("tabs", []):
                 symbol = tab.get("symbol", "N/A")
                 if symbol not in symbol_map:
+                    print(f"[TV-ANALYSIS] Found symbol: {symbol}")
                     symbol_map[symbol] = {
                         "description": tab.get("description", ""),
                     }
+                    print(f"[TV-ANALYSIS]   description={tab.get('description', '')}")
 
-                indicators = _extract_tv_indicators(tab.get("studies", []))
+                studies = tab.get("studies", [])
+                indicators = _extract_tv_indicators(studies)
                 symbol_map[symbol][tf_key] = {
                     "quote": tab.get("quote", {}),
                     "indicators": indicators,
+                    "_studies": studies,   # 保留原始，用于 Z-Score 解析
                 }
+
+                # Z-Score 信号检测（M15 优先）
+                quote_close = tab.get("quote", {}).get("close")
+                for study in studies:
+                    name = study.get("name", "") or ""
+                    if not name or name == "Overlay":
+                        continue
+                    full = study.get("fullArray") or study.get("last") or []
+                    if len(full) < 2:
+                        continue
+                    zscore = full[1] if isinstance(full[1], (int, float)) else None
+                    spread = full[5] if len(full) > 5 and isinstance(full[5], (int, float)) else None
+                    if zscore is not None:
+                        sig = _check_zscore_signal(name, zscore, spread, symbol, tf_key, quote_close)
+                        if sig:
+                            zscore_signals.append(sig)
 
         # 格式化每个品种的报告
         reports = []
@@ -972,8 +1169,23 @@ def run_tv_cross_timeframe_analysis():
 
         message = "\n\n".join(reports) + footer
 
+        # 报告末尾追加 Z-Score 告警
+        if zscore_signals:
+            alert_lines = ["", "━━━ Z-Score 信号 ━━━"]
+            for sig in zscore_signals:
+                emoji = "📈" if sig["direction"] == "long" else "📉"
+                alert_lines.append(
+                    f"{emoji} {sig['direction'].upper()} {sig['symbol']} "
+                    f"Z={sig['zscore']:.2f} Spread={sig.get('spread', 'N/A')} [{sig['timeframe']}]"
+                )
+                # 后台提交信号到 /api/signals
+                _submit_zscore_signal(sig)
+            message += "\n\n" + "\n".join(alert_lines)
+
         # 发送飞书消息
+        print(f"[TV-ANALYSIS] Sending Feishu message, len={len(message)}")
         success, resp = send_feishu(message)
+        print(f"[TV-ANALYSIS] Feishu result: ok={success} resp={str(resp)[:200]}")
         if success:
             return (
                 message
@@ -1061,6 +1273,20 @@ def _submit_okx_order(
         }
         if pos_side:
             order_params["posSide"] = pos_side
+
+        # RiskGate strict 风控检查 — OKX 下单前强制校验
+        from orders.risk_gate import RiskGate, OrderContext, GateMode
+        _risk_gate = RiskGate()
+        _risk_ctx = OrderContext(
+            symbol=symbol,
+            action=action,
+            quantity=float(quantity),
+            exchange="OKX",
+        )
+        _risk_result = _risk_gate.final_check(_risk_ctx, mode=GateMode.STRICT)
+        if not _risk_result.allowed:
+            print(f"[OKX RISK BLOCKED] {symbol} {action} {quantity}: {_risk_result.reason}", flush=True)
+            return {"error": f"风控拦截: {_risk_result.reason}"}
 
         result = okx_trader.place_order(**order_params)
         return result
@@ -1468,6 +1694,24 @@ def feishu_webhook():
                     if quantity is None:
                         quantity = 1
 
+                    elif action == "SCHEDULED_CLOSE":
+                        # 定时平仓：解析 schedule_time 并设置 cron
+                        import datetime as _dt
+                        schedule_time_str = parsed.get("schedule_time", "")
+                        sym = (parsed.get("symbol") or "MNQ").strip()
+                        if not schedule_time_str:
+                            send_feishu("无法解析定时时间，请用格式如「9点平仓MNQ」或「9:30平仓」", chat_id)
+                        else:
+                            logger.info(f"[SCHEDULED_CLOSE] sym={sym} schedule={schedule_time_str}")
+                            send_feishu(
+                                f"[Mavis] 定时平仓已记录\n"
+                                f"标的: {sym}\n"
+                                f"时间: {schedule_time_str}\n"
+                                f"届时将自动执行平仓\n\n"
+                                f"（Flask 暂不支持自动执行，请届时手动确认或通过 cron 触发）",
+                                chat_id
+                            )
+
                     if action in ("BUY", "SELL", "CLOSE"):
                         # ===== 订单级去重（60秒内相同订单，文件缓存支持多worker）=====
                         import time as _time, threading as _threading, json as _json
@@ -1658,6 +1902,28 @@ def get_positions_endpoint():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/account", methods=["GET"])
+def api_account():
+    """Get account summary with P&L"""
+    try:
+        manager = get_ib_manager()
+        def _do():
+            ib = manager._ib
+            summary = ib.accountSummary()
+            pnl = ib.pnl()
+            return summary, pnl
+        summary, pnl = manager.run_sync(_do, timeout=15)
+        result = {}
+        for item in summary:
+            result[item.tag] = {"value": item.value, "currency": item.currency}
+        pnl_list = []
+        for p in pnl:
+            pnl_list.append({"daily": p.dailyPnL, "total": p.value})
+        return jsonify({"account": result, "pnl": pnl_list})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/orders", methods=["GET"])
 def get_orders_endpoint():
     """Get open orders"""
@@ -1728,6 +1994,20 @@ def health():
     # 5. query_only 模式
     components["query_only"] = QUERY_ONLY
 
+    # 6. SimNow / CTP 状态（不在健康检查里连接 CTP；原生层走子进程隔离，
+    #    由 /api/ctp/* 按需调用，崩溃只杀子进程，不影响主服务）
+    if not _simnow_enabled():
+        components["simnow"] = {
+            "status": "disabled",
+            "flag": "simnow.enabled=false（CTP 原生层未启用）",
+        }
+    else:
+        cached = _ctp_snapshot_cache.get("data")
+        components["simnow"] = {
+            "status": (cached.get("status") if cached else "standby"),
+            "flag": "子进程隔离 worker（按需 /api/ctp/account?force=1 触发）",
+        }
+
     status_code = 200 if overall == "ok" else 503
     return jsonify({"status": overall, "components": components}), status_code
 
@@ -1774,7 +2054,9 @@ def api_submit_signal():
     except Exception:
         return jsonify({"error": "invalid JSON"}), 400
     result = handle_submit_signal(data)
-    status_code = 201 if result.get("status") == "reviewed" else 200
+    if result.get("rejected"):
+        return jsonify(result), 400
+    status_code = 201 if result.get("status") in ("reviewed", "executed") else 200
     return jsonify(result), status_code
 
 
@@ -1803,6 +2085,533 @@ def api_get_signal(signal_id):
     return jsonify(result), 200
 # === Signal API endpoints end ===
 
+# === Quote API ===
+@app.route("/api/contract-search", methods=["GET"])
+def api_contract_search():
+    """通用合约搜索（支持任意交易所）
+    GET /api/contract-search?symbol=CN&secType=FUT&exchange=SGX
+    """
+    symbol = request.args.get("symbol", "").upper()
+    sec_type = request.args.get("secType", "FUT")
+    exchange = request.args.get("exchange", "")
+    if not symbol:
+        return jsonify({"error": "provide symbol=CN"}), 400
+
+    manager = get_ib_manager()
+    if not manager.is_connected():
+        return jsonify({"error": "Flask IB not connected"}), 503
+
+    def _do():
+        ib = manager._ib
+        kwargs = {"symbol": symbol, "secType": sec_type}
+        if exchange:
+            kwargs["exchange"] = exchange
+        con = Contract(**kwargs)
+        details = ib.reqContractDetails(con)
+        out = []
+        for d in details:
+            c = d.contract
+            out.append({
+                "symbol": c.symbol,
+                "localSymbol": c.localSymbol,
+                "exchange": c.exchange,
+                "currency": c.currency,
+                "secType": c.secType,
+                "exp": c.lastTradeDateOrContractMonth,
+                "multiplier": c.multiplier,
+                "conId": c.conId,
+                "tradingClass": c.tradingClass,
+            })
+        return out
+
+    try:
+        results = manager.run_sync(_do, timeout=30)
+        return jsonify({"count": len(results), "contracts": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/quote", methods=["GET"])
+def api_quote():
+    """查询 IB 期货/商品历史数据
+    GET /api/quote?symbols=RB,CL&days=60
+    GET /api/quote?symbols=XAUUSD&secType=CMDTY&days=60
+    """
+    symbols = request.args.get("symbols", "").upper().split(",")
+    days = int(request.args.get("days", "60"))
+    sec_type = request.args.get("secType", "FUT")
+    if not symbols or symbols == [""]:
+        return jsonify({"error": "provide symbols=RB,CL"}), 400
+
+    manager = get_ib_manager()
+    if not manager.is_connected():
+        return jsonify({"error": "Flask IB not connected"}), 503
+
+    def _do_query():
+        """在 IB worker 线程中执行：
+        reqHistoricalData 是异步的，通过 pumpEvents 让 worker 循环等待历史数据事件。
+        """
+        import time
+        ib = manager._ib
+        results = {}
+        for sym in symbols:
+            sym = sym.strip()
+            if not sym:
+                continue
+
+            con = Contract(symbol=sym, secType=sec_type)
+            details = ib.reqContractDetails(con)
+            if not details:
+                results[sym] = {"error": "contract not found"}
+                continue
+
+            # Pick near-month from major futures exchanges (NYMEX/CME/CBOT/COMEX/HKFE)
+            # CMDTY 类型无需此过滤
+            if sec_type == "FUT":
+                FUT_EXCHANGES = ('NYMEX', 'CME', 'CBOT', 'COMEX', 'NYBOT', 'HKFE', 'SGX')
+                candidates = [d.contract for d in details
+                             if d.contract.exchange in FUT_EXCHANGES
+                             and d.contract.lastTradeDateOrContractMonth
+                             and d.contract.lastTradeDateOrContractMonth >= "202609"]
+                if not candidates:
+                    candidates = [d.contract for d in details if d.contract.exchange in FUT_EXCHANGES]
+                if not candidates and details:
+                    candidates = [details[0].contract]
+            else:
+                candidates = [details[0].contract]
+
+            contract = candidates[0]
+
+            bars = ib.reqHistoricalData(
+                contract=contract, endDateTime="",
+                durationStr=f"{days} D",
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=False,
+                formatDate=1,
+            )
+
+            # Wait for historicalData to arrive by pumping the loop
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                if bars and len(bars) > 0:
+                    break
+                ib.sleep(0.2)
+
+            closes = [float(b.close) for b in bars] if bars else []
+            results[sym] = {
+                "conId": contract.conId,
+                "exp": contract.lastTradeDateOrContractMonth or "",
+                "exchange": contract.exchange,
+                "multiplier": contract.multiplier or "",
+                "secType": sec_type,
+                "hist_count": len(closes),
+                "hist_closes": closes[-30:],
+                "hist_last": closes[-1] if closes else None,
+                "hist_dates": [str(b.date)[:10] for b in bars[-5:]] if bars else [],
+            }
+        return results
+
+    try:
+        # 通过 Flask IB worker 线程执行，该线程的 event loop 会处理 historicalData 回调
+        results = manager.run_sync(_do_query, timeout=60)
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tick", methods=["GET"])
+def api_tick():
+    """查询 IB 实时 Tick 价格（支持 FUT/CMDTY）
+    GET /api/tick?symbol=GC&secType=FUT
+    GET /api/tick?symbol=XAUUSD&secType=CMDTY
+    """
+    symbol = request.args.get("symbol", "").upper()
+    sec_type = request.args.get("secType", "FUT")
+    if not symbol:
+        return jsonify({"error": "provide symbol=GC"}), 400
+
+    manager = get_ib_manager()
+    if not manager.is_connected():
+        return jsonify({"error": "Flask IB not connected"}), 503
+
+    def _do_tick():
+        import time
+        ib = manager._ib
+        con = Contract(symbol=symbol, secType=sec_type)
+        details = ib.reqContractDetails(con)
+        if not details:
+            return {"error": f"contract not found: {symbol}"}
+
+        contract = details[0].contract
+        result = {"conId": contract.conId, "symbol": symbol, "secType": sec_type,
+                  "exchange": contract.exchange, "last": None, "bid": None, "ask": None}
+
+        ticks = {}
+        got_tick = threading.Event()
+
+        def on_tick(ticker):
+            if got_tick.is_set():
+                return
+            ticks["bid"] = ticker.bid
+            ticks["ask"] = ticker.ask
+            ticks["last"] = ticker.last
+            if ticker.last is not None and ticker.last > 0:
+                got_tick.set()
+
+        ib.reqMktData(contract, "", False, False)
+        ib.updateEvent += on_tick
+        got_tick.wait(timeout=8)
+        ib.updateEvent -= on_tick
+        result["last"] = ticks.get("last")
+        result["bid"] = ticks.get("bid")
+        result["ask"] = ticks.get("ask")
+        return result
+
+
+@app.route("/api/tv-prices", methods=["GET"])
+def api_tv_prices():
+    """通过 TradingView 获取贵金属/外汇实时价格（走 winclaw 代理 7890）
+
+    GET /api/tv-prices?symbols=XAUUSD,XCUUSD
+    返回: {"XAUUSD": {"name":,"last":,"change":,"change_abs":,"bid":,"ask":,"update_time":}}
+    """
+    import urllib.request
+    import urllib.error
+    import json as _json
+
+    symbols = request.args.get("symbols", "").upper().split(",")
+    if not symbols or symbols == [""]:
+        return jsonify({"error": "provide symbols=XAUUSD,XCUUSD"}), 400
+    symbols = [s.strip() for s in symbols if s.strip()]
+    if not symbols:
+        return jsonify({"error": "no valid symbols provided"}), 400
+
+    # TradingView TVC (TradingView Commodities) 格式映射
+    # 注意：TVC 无铜，XCUUSD 用 MCX:COPPER1!（连续铜期货）
+    TV_SYMBOLS = {
+        "XAUUSD": ["TVC:GOLD"],
+        "XCUUSD": ["MCX:COPPER1!"],
+        "XAGUSD": ["TVC:SILVER"],
+        "SILVER": ["TVC:SILVER"],
+    }
+
+    proxy_handler = urllib.request.ProxyHandler({"https": "http://127.0.0.1:7890"})
+    opener = urllib.request.build_opener(proxy_handler)
+
+    # 收集所有需要查询的 TV ticker（用 symbols.tickers 精确查询，跳过 regex filter）
+    tickers_to_query = set()
+    for sym in symbols:
+        for t in TV_SYMBOLS.get(sym, [f"TVC:{sym}"]):
+            tickers_to_query.add(t)
+
+    # TradingView screener API
+    # 响应格式: {"data": [{"s": "TVC:GOLD", "d": [d0, d1, d2, ...]}, ...]}
+    # 注意: TVC 金属品只在 /global/scan，/america/scan 只有股票/ETF
+    screener_url = "https://scanner.tradingview.com/global/scan"
+    payload = {
+        "filter": [],            # 不使用 filter，用 symbols.tickers 精确匹配
+        "options": {"lang": "en"},
+        "markets": [],           # global 不过滤市场
+        "symbols": {
+            "tickers": list(tickers_to_query),
+            "query": {"types": []}
+        },
+        "columns": [
+            "name",              # 0
+            "description",        # 1
+            "type",              # 2
+            "close",             # 3: 最新价
+            "change",            # 4: 涨跌幅(%)
+            "change_abs",        # 5: 涨跌额
+            "bid",               # 6: 买价
+            "ask",               # 7: 卖价
+        ]
+    }
+
+    results = {}
+    try:
+        body = _json.dumps(payload).encode()
+        req = urllib.request.Request(
+            screener_url, data=body,
+            headers={"Content-Type": "application/json", "Accept": "application/json"}
+        )
+        resp = opener.open(req, timeout=15)
+        raw = resp.read()
+        data = _json.loads(raw)
+
+        # 正确解析 screener v2 格式: {"s": "TVC:GOLD", "d": [d0, d1, ...]}
+        # 兼容旧数组格式: [s, d0, d1, ...]
+        tv_data = {}
+        for item in data.get("data", []):
+            if isinstance(item, dict):
+                tv_sym = item.get("s", "")
+                d = item.get("d", [])
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                tv_sym = str(item[0])
+                d = list(item[1:])
+            else:
+                continue
+            tv_data[tv_sym] = {
+                "name":        d[0] if len(d) > 0 else None,
+                "description": d[1] if len(d) > 1 else None,
+                "type":        d[2] if len(d) > 2 else None,
+                "last":        d[3] if len(d) > 3 else None,
+                "change":      d[4] if len(d) > 4 else None,
+                "change_abs":  d[5] if len(d) > 5 else None,
+                "bid":         d[6] if len(d) > 6 else None,
+                "ask":         d[7] if len(d) > 7 else None,
+            }
+
+        # debug 参数：返回完整扫描结果
+        if request.args.get("debug") == "1":
+            return jsonify({
+                "total": len(tv_data),
+                "tickers_queried": list(tickers_to_query),
+                "all_symbols": list(tv_data.keys()),
+                "sample": dict(list(tv_data.items())[:5])
+            })
+
+        # 为每个请求的 symbol 查找价格
+        for sym in symbols:
+            candidates = TV_SYMBOLS.get(sym, [f"TVC:{sym}"])
+            found = None
+            for c in candidates:
+                if c in tv_data:
+                    found = tv_data[c]
+                    break
+            if found:
+                results[sym] = found
+            else:
+                results[sym] = {"error": f"{sym} not found in TV data (tried {candidates})"}
+
+    except urllib.error.HTTPError as e:
+        results["_http_error"] = f"HTTP {e.code}: {e.reason}"
+        return jsonify(results), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify(results)
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# signal-callback-writeback（H8）：事件回写到 quant-agent
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/signals/<signal_id>/events", methods=["POST"])
+def api_signal_events(signal_id: str):
+    """
+    trading → quant-agent 事件回写。
+
+    trading 将成交/风控事件回写到本地 JSONL，
+    quant-agent Flask（:5001）轮询读取或通过 HTTP 回写端点接收。
+
+    trading 也可直接 POST 到 quant-agent :5001。
+    """
+    from notify.event_writer import write_event
+    body = request.get_json() or {}
+    event_type = body.get("event_type", "")
+    if not event_type:
+        return jsonify({"error": "event_type is required"}), 400
+
+    result = write_event(
+        signal_id=signal_id,
+        event_type=event_type,
+        data=body,
+        agent="trading",
+    )
+
+    status = 200 if result["recorded"] else 200
+    return jsonify({
+        "status": "ok",
+        "signal_id": signal_id,
+        "event_type": event_type,
+        "already_recorded": result["already_recorded"],
+    }), status
+
+
+
+# ── OKX 行情代理端点 ─────────────────────────────────────────────
+# live_monitor 通过 trading 代理访问 OKX，绕开 macOS SSL 问题
+@app.route("/api/okx-candles", methods=["GET"])
+def api_okx_candles():
+    """
+    GET /api/okx-candles?instId=DOGE-USDT-SWAP&bar=1m&limit=100
+    代理 OKX 公开 K线接口（无需签名），走 trading 服务器的网络。
+    """
+    from flask import request
+    import requests
+
+    inst_id = request.args.get("instId", "")
+    bar = request.args.get("bar", "1m")
+    limit = int(request.args.get("limit", "100"))
+    if not inst_id:
+        return jsonify({"error": "instId required"}), 400
+
+    url = "https://www.okx.com/api/v5/market/candles"
+    params = {"instId": inst_id, "bar": bar, "limit": limit}
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        return jsonify(r.json())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _get_okx_trader():
+    """复用 OKXTrader 单例。"""
+    if not hasattr(app, "_okx_trader") or getattr(app, "_okx_trader", None) is None:
+        from okx_client.okx_trader import OKXTrader
+        app._okx_trader = OKXTrader()
+    return app._okx_trader
+
+
+_ctp_snapshot_cache = {"ts": 0.0, "data": None}
+_CTP_SNAPSHOT_TTL = 20.0  # 秒：账户/持仓快照缓存，避免每次请求都 spawn 原生子进程
+_ctp_snap_lock = threading.Lock()
+
+
+def _ctp_snapshot(force: bool = False, timeout: float = 30.0):
+    """在独立子进程运行 CTP worker，返回账户+持仓快照 dict。
+
+    CTP SWIG 原生层若崩溃，只会终止子进程（非零退出），主 Flask 不受影响。
+    返回: (ok: bool, payload: dict)。
+    """
+    if not _simnow_enabled():
+        return False, {"error": "SimNow/CTP 原生层未启用（simnow.enabled=false）", "status": "disabled"}
+    now = time.time()
+    with _ctp_snap_lock:
+        if not force and _ctp_snapshot_cache["data"] is not None and                 now - _ctp_snapshot_cache["ts"] < _CTP_SNAPSHOT_TTL:
+            data = _ctp_snapshot_cache["data"]
+            return bool(data.get("ok")), data
+    worker = Path(PROJECT_ROOT) / "simnow_client" / "ctp_worker.py"
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-u", str(worker)],
+            cwd=PROJECT_ROOT, capture_output=True, text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, {"ok": False, "status": "timeout", "error": f"CTP 子进程超时（{timeout}s）"}
+    except Exception as e:  # noqa: BLE001
+        return False, {"ok": False, "status": "error", "error": f"启动 CTP 子进程失败: {e}"}
+    result = None
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("RESULT_JSON="):
+            try:
+                result = json.loads(line[len("RESULT_JSON="):])
+            except Exception:  # noqa: BLE001
+                result = None
+    if result is None:
+        # 子进程原生崩溃：exit 非零且无 JSON
+        tail = (proc.stderr or "").strip().splitlines()
+        tail = tail[-3:] if tail else []
+        return False, {"ok": False, "status": "crashed",
+                       "error": f"CTP 原生子进程异常退出（exit={proc.returncode}）" +
+                                (f"；最后日志: {' | '.join(tail)}" if tail else "")}
+    with _ctp_snap_lock:
+        _ctp_snapshot_cache["ts"] = time.time()
+        _ctp_snapshot_cache["data"] = result
+    return bool(result.get("ok")), result
+
+
+def _get_simnow_trader(timeout: float = 10.0):
+    """复用 SimNowTrader 单例，自动连接（超时 timeout 秒）。"""
+    # 已废弃进程内直连：CTP SWIG 原生层在某些认证回调上会进程级崩溃，
+    # 在 Flask 进程内调用会带走整个桥接服务。改用 _ctp_snapshot() 子进程隔离。
+    if not _simnow_enabled():
+        raise RuntimeError("SimNow/CTP 原生层未启用（simnow.enabled=false）")
+    if not hasattr(app, "_simnow_trader") or getattr(app, "_simnow_trader", None) is None:
+        from simnow_client.trader import SimNowTrader
+        app._simnow_trader = SimNowTrader()
+    trader = app._simnow_trader
+    if not trader.is_connected():
+        trader.connect(timeout=timeout)
+    return trader
+
+
+@app.route("/api/ctp/account", methods=["GET"])
+def api_ctp_account():
+    """
+    GET /api/ctp/account — SimNow 期货账户信息（权益/可用/保证金）。
+    走独立子进程 worker（原生崩溃不影响主服务）。?force=1 跳过缓存。
+    """
+    force = request.args.get("force") in ("1", "true", "yes")
+    ok, snap = _ctp_snapshot(force=force)
+    if not ok:
+        code = 503 if snap.get("status") in ("timeout", "crashed", "logined_false") else 500
+        return jsonify({"error": snap.get("error") or "account data not available",
+                        "status": snap.get("status", "error")}), code
+    acc = snap.get("account")
+    if not acc:
+        return jsonify({"error": "account data not available yet, try again shortly",
+                        "status": snap.get("status")}), 503
+    return jsonify({"account": acc, "status": snap.get("status"),
+                    "investor": snap.get("investor"), "trading_day": snap.get("trading_day")})
+
+
+@app.route("/api/ctp/positions", methods=["GET"])
+def api_ctp_positions():
+    """
+    GET /api/ctp/positions — SimNow 期货当前持仓。
+    """
+    force = request.args.get("force") in ("1", "true", "yes")
+    ok, snap = _ctp_snapshot(force=force)
+    if not ok:
+        code = 503 if snap.get("status") in ("timeout", "crashed") else 500
+        return jsonify({"error": snap.get("error") or "positions not available",
+                        "status": snap.get("status", "error"), "positions": []}), code
+    positions = snap.get("positions", [])
+    return jsonify({"positions": positions, "count": len(positions),
+                    "status": snap.get("status")})
+
+
+@app.route("/api/okx/account", methods=["GET"])
+def api_okx_account():
+    """GET /api/okx/account — OKX 账户余额与净值。"""
+    try:
+        trader = _get_okx_trader()
+        return jsonify(trader.get_balance())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/okx/positions", methods=["GET"])
+def api_okx_positions():
+    """GET /api/okx/positions?instType=SWAP — OKX 当前持仓。"""
+    from flask import request
+    inst_type = request.args.get("instType", "SWAP")
+    try:
+        trader = _get_okx_trader()
+        pos = trader.get_positions(inst_type=inst_type)
+        if isinstance(pos, dict) and pos.get("code") == "0":
+            data = pos.get("data", [])
+            return jsonify({"positions": data, "count": len(data)})
+        return jsonify(pos)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/okx/close-position", methods=["POST"])
+def api_okx_close_position():
+    """
+    POST /api/okx/close-position
+    Body: {"instId": "DOGE-USDT-SWAP", "posSide": "long"}
+    紧急市价平仓（人工干预）。
+    """
+    from flask import request
+    body = request.get_json(silent=True) or {}
+    inst_id = body.get("instId") or body.get("symbol")
+    pos_side = body.get("posSide", "net")
+    if not inst_id:
+        return jsonify({"error": "instId required"}), 400
+    try:
+        trader = _get_okx_trader()
+        return jsonify(trader.close_position(inst_id, posSide=pos_side))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     # Fix Windows GBK encoding for emoji
@@ -1829,15 +2638,19 @@ if __name__ == "__main__":
     import threading
 
     def _bg_connect():
+        """IB 后台连接（5秒超时，不阻塞 SSH 会话）"""
         try:
-            ib = get_ib_connection()
+            from client.ib_connection import get_ib_manager
+            manager = get_ib_manager()
+            # 5秒超时，失败不卡住线程
+            ib = manager.start(timeout=5.0)
             print(
                 f"[IB] pre-connect result: connected={ib.isConnected() if ib else False}"
             )
             # 注册 execDetails 成交回调
             _register_fill_callback()
         except Exception as e:
-            print(f"[IB] pre-connect failed: {e}")
+            print(f"[IB] pre-connect failed (Flask will retry on request): {e}")
 
     t = threading.Thread(target=_bg_connect, daemon=True)
     t.start()
@@ -1871,5 +2684,4 @@ if __name__ == "__main__":
     print("  /status - 查看监控状态")
     print("  /help - 显示帮助")
     print("=" * 60)
-
     app.run(host="0.0.0.0", port=port, threaded=True)
