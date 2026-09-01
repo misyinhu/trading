@@ -284,7 +284,7 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         f.InstrumentID = str(o["instrument_id"])
         f.ExchangeID = str(o.get("exchange_id", ""))
         f.ActionFlag = "0"  # 撤单
-        sysid = str(o.get("order_sys_id", "") or "")
+        sysid = str(o.get("order_sys_id", "") or "").strip()
         if sysid:
             # 跨会话撤单：优先用交易所系统号
             f.OrderSysID = sysid
@@ -331,7 +331,7 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             ref = str(getattr(p, "OrderRef", ""))
             ev = {
                 "order_ref": ref,
-                "order_sys_id": str(getattr(p, "OrderSysID", "") or ""),
+                "order_sys_id": str(getattr(p, "OrderSysID", "") or "").strip(),
                 "status": status,
                 "status_msg": str(getattr(p, "StatusMsg", "") or ""),
                 "instrument_id": str(getattr(p, "InstrumentID", "") or ""),
@@ -380,7 +380,7 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         try:
             tr = {
                 "order_ref": str(getattr(p, "OrderRef", "")),
-                "order_sys_id": str(getattr(p, "OrderSysID", "") or ""),
+                "order_sys_id": str(getattr(p, "OrderSysID", "") or "").strip(),
                 "trade_id": str(getattr(p, "TradeID", "") or ""),
                 "instrument_id": str(getattr(p, "InstrumentID", "") or ""),
                 "direction": str(getattr(p, "Direction", "")),

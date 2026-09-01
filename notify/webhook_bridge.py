@@ -2641,10 +2641,11 @@ def api_ctp_cancel():
     """
     POST /api/ctp/cancel — SimNow 期货撤单。
     Body 二选一：
-      A) {"order_sys_id": "...", "exchange_id": "SHFE", "instrument_id": "rb2410"}
-      B) {"order_ref": "12345", "front_id": 1, "session_id": -123,
-          "exchange_id": "SHFE", "instrument_id": "rb2410"}
-    order_sys_id 方式跨会话更稳（推荐用报单返回的 order_sys_id）。
+      A) {"order_ref": "12345", "front_id": 1, "session_id": 1656487732,
+          "exchange_id": "CFFEX", "instrument_id": "IF2609"}   ← 推荐，已在 SimNow 验证
+      B) {"order_sys_id": "359686", "exchange_id": "CFFEX", "instrument_id": "IF2609"}
+         （交易所系统号；SimNow 跨连接系统号撤单偶发 [25] 找不到报单，优先用 A）
+    order_ref/front_id/session_id 均来自 /api/ctp/order 报单返回的 action_result。
     """
     body = request.get_json(silent=True) or {}
     if not body.get("instrument_id"):
@@ -2653,7 +2654,7 @@ def api_ctp_cancel():
     has_ref = bool(body.get("order_ref"))
     if not (has_sysid or has_ref):
         return jsonify({"ok": False,
-                        "error": "需提供 order_sys_id（推荐）或 order_ref(+front_id/session_id)"}), 400
+                        "error": "需提供 order_ref(+front_id/session_id)（推荐）或 order_sys_id"}), 400
     ok, res = _ctp_run_action("cancel", body)
     code = 200 if ok else (503 if res.get("status") in ("timeout", "crashed", "disabled") else 400)
     return jsonify(res), code
