@@ -110,6 +110,7 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         self._order_ref = ""
         self._settled_fired = False
         self._instr_done = False
+        self._md_done = False
 
     def _nrid(self):
         self._rid += 1
@@ -179,7 +180,7 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             self.state["settled"] = True
             _log("settlement confirmed")
         self._settled_fired = True
-        if self.action == "instruments":
+        if self.action in ("instruments", "main_contract"):
             try:
                 self._do_query_instruments()
             except Exception as e:  # noqa: BLE001
@@ -415,6 +416,59 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         if last:
             self._instr_done = True
             _log(f"instruments done: {len(self.state['instruments'])}")
+            if self.action == "main_contract":
+                try:
+                    self._do_query_market_data()
+                except Exception as e:  # noqa: BLE001
+                    _log(f"market data query submit error: {type(e).__name__}: {e}")
+                    self._md_done = True
+
+    def _do_query_market_data(self):
+        # 行情深度查询 CThostFtdcQryDepthMarketDataField 仅支持按 InstrumentID 精确查
+        # （空合约号会拉全市场数千合约，回调洪流导致超时）。因此对可交易月份逐个查，
+        # 串行 + 查询流控间隔（CTP 查询类接口约 1 次/秒）。
+        tradable = [x["instrument_id"] for x in self.state.get("instruments", [])
+                    if x.get("is_trading")]
+        self.state["_md_queue"] = list(tradable)
+        self.state["market"] = {}
+        _log(f"query depth market data one-by-one for {len(tradable)} instruments")
+        self._query_next_market()
+
+    def _query_next_market(self):
+        queue = self.state.get("_md_queue", [])
+        if not queue:
+            self._md_done = True
+            _log(f"market data done: {len(self.state.get('market', {}))} quotes")
+            return
+        iid = queue.pop(0)
+        f = T.CThostFtdcQryDepthMarketDataField()
+        f.InstrumentID = iid
+        rc = self.api.ReqQryDepthMarketData(f, self._nrid())
+        if rc != 0:
+            _log(f"ReqQryDepthMarketData({iid}) ret={rc}")
+            # 流控/失败：跳过该合约，继续下一个
+            self._query_next_market()
+
+    def OnRspQryDepthMarketData(self, p, info, n, last):
+        if p is not None:
+            try:
+                iid = str(getattr(p, "InstrumentID", "") or "")
+                if iid:
+                    self.state["market"][iid] = {
+                        "last_price": _num(p, "LastPrice"),
+                        "open_interest": int(float(getattr(p, "OpenInterest", 0) or 0)),
+                        "volume": int(float(getattr(p, "Volume", 0) or 0)),
+                        "upper_limit": _num(p, "UpperLimitPrice"),
+                        "lower_limit": _num(p, "LowerLimitPrice"),
+                        "bid_price1": _num(p, "BidPrice1"),
+                        "ask_price1": _num(p, "AskPrice1"),
+                    }
+            except Exception as e:  # noqa: BLE001
+                _log(f"depth market parse fail: {type(e).__name__}: {e}")
+        if last:
+            # 查询流控：串行查下一合约前稍作等待（worker 独立进程，短暂阻塞回调线程可接受）
+            time.sleep(0.8)
+            self._query_next_market()
 
     def _rsp_info(self, info):
         if info is None:
@@ -547,6 +601,7 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0)
                       "settled": False, "acct_done": False, "pos_done": False,
                       "front_id": 0, "session_id": 0,
                       "order_events": [], "trade_events": [], "instruments": [], "orders": [],
+                      "market": {},
                       "action_done": False, "action_result": None, "order_ref": ""}
 
     api = T.CThostFtdcTraderApi.CreateFtdcTraderApi("")
@@ -575,6 +630,9 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0)
         elif action == "instruments":
             if spi._instr_done:
                 break
+        elif action == "main_contract":
+            if spi._md_done:
+                break
         else:
             if state["logined"] and state["pos_done"]:
                 break
@@ -596,6 +654,32 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0)
         "positions": state["positions"],
         "front_id": state["front_id"], "session_id": state["session_id"],
     }
+    if action == "main_contract":
+        insts = state.get("instruments", [])
+        market = state.get("market", {})
+        for x in insts:
+            q = market.get(x["instrument_id"]) or {}
+            x.update({"open_interest": q.get("open_interest", 0),
+                      "volume": q.get("volume", 0),
+                      "last_price": q.get("last_price"),
+                      "upper_limit": q.get("upper_limit"),
+                      "lower_limit": q.get("lower_limit")})
+        tradable = [x for x in insts if x.get("is_trading")] or insts
+        with_oi = [x for x in tradable if x.get("open_interest")]
+        # 主力 = 持仓量最大；行情缺失时回退近月
+        if with_oi:
+            main = max(with_oi, key=lambda x: x["open_interest"])
+        else:
+            main = sorted(tradable, key=lambda x: (x.get("expire_date") or "99999999"))[0] if tradable else None
+        front = sorted(tradable, key=lambda x: (x.get("expire_date") or "99999999"))
+        out["instruments"] = insts
+        out["tradable_count"] = len(tradable)
+        out["main_contract"] = main
+        out["front_contract"] = front[0] if front else None
+        out["main_by"] = "open_interest" if with_oi else "nearest_expiry_fallback"
+        out["status"] = "main_contract"
+        out["ok"] = bool(main)
+        return out
     if action == "instruments":
         insts = state.get("instruments", [])
         tradable = [x for x in insts if x.get("is_trading")] or insts

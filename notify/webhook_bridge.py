@@ -2682,23 +2682,25 @@ def api_ctp_instruments():
 def api_ctp_main_contract():
     """
     GET /api/ctp/main-contract?product=IC&exchange=CFFEX
-    返回该品种的近月可交易合约（前端可直接用作 instrument_id 报单）。
-    注意：真实"主力"按持仓量最大判定，需行情 OI；此处返回最近到期可交易合约
-    作为默认候选，并附全部月份供上层按持仓量选择。
+    按行情持仓量(OpenInterest)最大判定主力合约（真实主力）；返回各月份
+    OI/成交量/最新价/涨跌停，main_contract 可直接用作 instrument_id 报单。
+    行情缺失时回退为最近到期可交易合约（main_by 标注判定依据）。
     """
     product = (request.args.get("product", "") or "").strip()
     exchange = (request.args.get("exchange", "") or "").strip()
     if not product:
         return jsonify({"ok": False, "error": "缺少 product（如 IC）"}), 400
-    ok, res = _ctp_run_action("instruments",
+    ok, res = _ctp_run_action("main_contract",
                               {"product": product, "exchange_id": exchange},
-                              timeout=40.0)
+                              timeout=45.0)
     if not ok:
         code = 503 if res.get("status") in ("timeout", "crashed", "disabled") else 400
         return jsonify(res), code
     return jsonify({
         "ok": True, "product": product.upper(),
         "exchange": exchange.upper() or None,
+        "main_by": res.get("main_by", "open_interest"),
+        "main_contract": res.get("main_contract"),
         "front_contract": res.get("front_contract"),
         "instruments": res.get("instruments", []),
         "tradable_count": res.get("tradable_count", 0),
