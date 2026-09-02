@@ -30,7 +30,8 @@ _CTP_SWG_PATHS = {
     "simnow": r"C:\tmp\ctp_api\ctp_swig_build-6.7.11.1\ctp_api",
     # 中信看穿式(CP)评测：必须用 CP 版交易库 v6.7.7_CP + 终端采集库 WinDataCollect.dll，
     # 否则前置握手 "Front shake hand err: decode err / Decrypt handshake data failed"。
-    "citic": r"C:\tmp\ctp_api\ctp_swig_build-6.7.7cp\ctp_api",
+    # 实测评测前置匹配 v6.5.1_CP 参考套件（自带同源 WinDataCollect）；6.7.7CP 会终端校验失败 [3]。
+    "citic": r"C:\tmp\ctp_api\ctp_swig_build-6.5.1cp\ctp_api",
 }
 _profile_early = os.environ.get("CTP_PROFILE", "simnow").strip().lower()
 _CTP_SWG_PATH = _CTP_SWG_PATHS.get(_profile_early, _CTP_SWG_PATHS["simnow"])
