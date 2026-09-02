@@ -178,6 +178,11 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         self._settled_fired = False
         self._instr_done = False
         self._md_done = False
+        self._pos_mult_queue = []
+        self._pos_mult_map = {}
+        self._detail_rows = []
+        self._detail_deadline = 0.0
+        self._detail_merged = False
 
     def _nrid(self):
         self._rid += 1
@@ -247,12 +252,26 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             self.state["settled"] = True
             _log("settlement confirmed")
         self._settled_fired = True
+        if self.action == "depth":
+            try:
+                self._do_depth_one()
+            except Exception as e:
+                _log(f"depth query submit error: {type(e).__name__}: {e}")
+                self.state["depth_done"] = True
+            return
         if self.action in ("instruments", "main_contract"):
             try:
                 self._do_query_instruments()
             except Exception as e:  # noqa: BLE001
                 _log(f"instrument query submit error: {type(e).__name__}: {e}")
                 self._instr_done = True
+            return
+        if self.action == "trades":
+            try:
+                self._do_query_trades()
+            except Exception as e:  # noqa: BLE001
+                _log(f"trades query submit error: {type(e).__name__}: {e}")
+                self.state["trades_done"] = True
             return
         if self.action in ("order", "cancel"):
             try:
@@ -303,14 +322,85 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
                         "symbol": getattr(p, "InstrumentID", ""),
                         "direction": str(getattr(p, "Direction", "")),
                         "volume": int(float(vol)),
-                        "avg_price": float(getattr(p, "PositionCost", 0) or 0),
+                        # OpenCost=开仓总额(价×量×乘数)；均价待查到合约乘数后换算
+                        "open_cost": float(getattr(p, "OpenCost", 0) or 0),
+                        "avg_price": 0.0,
                         "float_pnl": float(getattr(p, "PositionProfit", 0) or 0),
                     })
             except Exception as e:  # noqa: BLE001
                 _log(f"position parse fail: {e}")
         if last:
+            self._start_position_detail()
+
+    def _start_position_detail(self):
+        # 快照路径：净持仓模式下聚合持仓的 PosiDirection='3'(净) 无法区分多空，
+        # 且 OpenCost/PositionCost 为盯市口径。逐笔持仓明细(PositionDetail)
+        # 权威给出 开仓方向(0买/1卖)、开仓价(OpenPrice)、开仓日期(OpenDate)。
+        # 一次空合约号查询返回全部明细。
+        if self.action in ("instruments", "main_contract"):
             self.state["pos_done"] = True
-            _log(f"positions done: {len(self.state['positions'])}")
+            return
+        self._detail_rows = []
+        f = T.CThostFtdcQryInvestorPositionDetailField()
+        f.BrokerID = self.cfg["broker_id"]
+        f.InvestorID = self.state["investor"]
+        rc = self.api.ReqQryInvestorPositionDetail(f, self._nrid())
+        self._detail_deadline = time.time() + 5.0  # 兜底：明细回调不来也强制收口
+        if rc != 0:
+            _log(f"ReqQryInvestorPositionDetail ret={rc} -> fallback to aggregate fields")
+            self._merge_position_detail()
+
+    def OnRspQryInvestorPositionDetail(self, p, info, n, last):
+        if p is not None:
+            try:
+                vol = int(float(getattr(p, "Volume", 0) or 0))
+                iid = str(getattr(p, "InstrumentID", "") or "")
+                if iid and vol:
+                    self._detail_rows.append({
+                        "symbol": iid,
+                        "direction": str(getattr(p, "Direction", "") or ""),
+                        "volume": vol,
+                        "open_price": float(getattr(p, "OpenPrice", 0) or 0),
+                        "open_date": str(getattr(p, "OpenDate", "") or ""),
+                    })
+            except Exception as e:  # noqa: BLE001
+                _log(f"position detail parse fail: {type(e).__name__}: {e}")
+        if last:
+            self._merge_position_detail()
+
+    def _merge_position_detail(self):
+        if self._detail_merged:
+            return
+        self._detail_merged = True
+        # 按合约聚合明细：净多空方向 + 手数加权开仓均价 + 最早开仓日期
+        agg = {}
+        for r in getattr(self, "_detail_rows", []):
+            d = agg.setdefault(r["symbol"], {"buy": 0, "sell": 0, "pv": 0.0,
+                                             "dates": []})
+            if r["direction"] == "1":
+                d["sell"] += r["volume"]
+            else:
+                d["buy"] += r["volume"]
+            d["pv"] += r["open_price"] * r["volume"]
+            if r["open_date"]:
+                d["dates"].append(r["open_date"])
+        for pos in self.state.get("positions", []):
+            sym = pos.get("symbol")
+            d = agg.get(sym)
+            pos.pop("open_cost", None)
+            if d and (d["buy"] + d["sell"]) > 0:
+                total = d["buy"] + d["sell"]
+                pos["direction"] = "1" if d["sell"] > d["buy"] else "0"
+                pos["avg_price"] = round(d["pv"] / total, 4)
+                pos["open_date"] = min(d["dates"]) if d["dates"] else ""
+            else:
+                # 明细缺失：方向置空，均价回退为 0（避免把盯市总额误显示成单价）
+                pos.setdefault("direction", "")
+                pos["avg_price"] = 0.0
+                pos["open_date"] = ""
+        self.state["pos_done"] = True
+        _log(f"positions done: {len(self.state.get('positions', []))} "
+             f"(detail rows: {len(getattr(self, '_detail_rows', []))})")
 
     # ── 报单 / 撤单 ──────────────────────────────────────────────
     def _gen_order_ref(self) -> str:
@@ -350,6 +440,54 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             self.state["action_done"] = True
             self.state["action_result"] = {"ok": False, "order_ref": ref,
                                            "error": f"ReqOrderInsert ret={rc}"}
+
+    def _do_query_trades(self):
+        self.state["_trades_q_done"] = False
+        self.state["_orders_q_done"] = False
+        q = T.CThostFtdcQryTradeField()
+        q.BrokerID = self.cfg["broker_id"]
+        q.InvestorID = self.state["investor"]
+        if self.order and str(self.order.get("instrument_id", "")).strip():
+            q.InstrumentID = str(self.order["instrument_id"]).strip()
+        _log("trades: ReqQryTrade today")
+        rc = self.api.ReqQryTrade(q, self._nrid())
+        if rc != 0:
+            self.state["trades_done"] = True
+            self.state["trades_error"] = f"ReqQryTrade ret={rc}"
+
+    def _do_query_orders_only(self):
+        q = T.CThostFtdcQryOrderField()
+        q.BrokerID = self.cfg["broker_id"]
+        q.InvestorID = self.state["investor"]
+        if self.order and str(self.order.get("instrument_id", "")).strip():
+            q.InstrumentID = str(self.order["instrument_id"]).strip()
+        _log("trades: ReqQryOrder today")
+        rc = self.api.ReqQryOrder(q, self._nrid())
+        if rc != 0:
+            self.state["_orders_q_done"] = True
+
+    def OnRspQryTrade(self, p, info, n, last):
+        if p is not None:
+            try:
+                rec = {
+                    "trade_id": str(getattr(p, "TradeID", "") or ""),
+                    "order_ref": str(getattr(p, "OrderRef", "") or ""),
+                    "order_sys_id": str(getattr(p, "OrderSysID", "") or "").strip(),
+                    "instrument_id": str(getattr(p, "InstrumentID", "") or ""),
+                    "exchange_id": str(getattr(p, "ExchangeID", "") or ""),
+                    "direction": str(getattr(p, "Direction", "") or ""),
+                    "offset_flag": str(getattr(p, "OffsetFlag", "") or ""),
+                    "price": _num(p, "Price"),
+                    "volume": int(float(getattr(p, "Volume", 0) or 0)),
+                    "trade_time": str(getattr(p, "TradeTime", "") or ""),
+                }
+                self.state.setdefault("trades", []).append(rec)
+            except Exception as e:  # noqa: BLE001
+                _log(f"qry trade parse fail: {e}")
+        if last:
+            self.state["_trades_q_done"] = True
+            _log(f"qry trades done: {len(self.state.get('trades', []))}")
+            self._do_query_orders_only()
 
     def _do_cancel(self):
         o = self.order
@@ -415,10 +553,21 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
                     "instrument_id": str(getattr(p, "InstrumentID", "") or ""),
                     "exchange_id": str(getattr(p, "ExchangeID", "") or ""),
                     "status": str(getattr(p, "OrderStatus", "") or ""),
+                    "status_msg": str(getattr(p, "StatusMsg", "") or ""),
+                    "direction": str(getattr(p, "Direction", "") or ""),
+                    "offset_flag": str(getattr(p, "CombOffsetFlag", "") or ""),
+                    "limit_price": _num(p, "LimitPrice"),
+                    "volume_total": int(float(getattr(p, "VolumeTotal", 0) or 0)),
+                    "volume_traded": int(float(getattr(p, "VolumeTraded", 0) or 0)),
+                    "insert_time": str(getattr(p, "InsertTime", "") or ""),
                 }
                 self.state["orders"].append(rec)
             except Exception as e:  # noqa: BLE001
                 _log(f"qry order parse fail: {e}")
+        if last and self.action == "trades":
+            self.state["_orders_q_done"] = True
+            _log(f"qry orders done: {len(self.state.get('orders', []))}")
+            return
         if last and self.state.get("_cancel_pending"):
             pend = self.state.pop("_cancel_pending")
             want_ref = pend.get("ref", "")
@@ -455,6 +604,19 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         self.api.ReqQryInstrument(f, self._nrid())
 
     def OnRspQryInstrument(self, p, info, n, last):
+        # 持仓均价换算路径：只取合约乘数，不写入 instruments 列表
+        if self.action not in ("instruments", "main_contract"):
+            if p is not None:
+                iid = str(getattr(p, "InstrumentID", "") or "")
+                if iid:
+                    try:
+                        self._pos_mult_map[iid] = int(float(getattr(p, "VolumeMultiple", 0) or 0))
+                    except Exception:  # noqa: BLE001
+                        pass
+            if last:
+                time.sleep(0.4)  # 查询流控：串行查下一合约
+                self._query_next_pos_mult()
+            return
         if p is not None:
             try:
                 prod = str(self.order.get("product", "")).strip().upper()
@@ -489,6 +651,16 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
                 except Exception as e:  # noqa: BLE001
                     _log(f"market data query submit error: {type(e).__name__}: {e}")
                     self._md_done = True
+
+    def _do_depth_one(self):
+        iid = str(self.order.get("instrument_id", "") or "").strip()
+        if not iid:
+            self.state["depth_done"] = True
+            return
+        f = T.CThostFtdcQryDepthMarketDataField()
+        f.InstrumentID = iid
+        rc = self.api.ReqQryDepthMarketData(f, self._nrid())
+        _log(f"depth query {iid} ret={rc}")
 
     def _do_query_market_data(self):
         # 行情深度查询 CThostFtdcQryDepthMarketDataField 仅支持按 InstrumentID 精确查
@@ -530,6 +702,12 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
                         "bid_price1": _num(p, "BidPrice1"),
                         "ask_price1": _num(p, "AskPrice1"),
                     }
+                    if (self.action == "depth" and iid
+                            and iid == str(self.order.get("instrument_id", "")).strip()):
+                        self.state["depth"] = dict(self.state["market"].get(iid, {}))
+                        self.state["depth"]["instrument_id"] = iid
+                        self.state["depth_done"] = True
+                        _log(f"depth {iid}: {self.state['depth']}")
             except Exception as e:  # noqa: BLE001
                 _log(f"depth market parse fail: {type(e).__name__}: {e}")
         if last:
@@ -677,6 +855,8 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0,
                       "settled": False, "acct_done": False, "pos_done": False,
                       "front_id": 0, "session_id": 0,
                       "order_events": [], "trade_events": [], "instruments": [], "orders": [],
+                      "trades": [], "trades_done": False, "trades_error": "",
+                      "_trades_q_done": False, "_orders_q_done": False,
                       "market": {},
                       "action_done": False, "action_result": None, "order_ref": "",
                       "profile": profile, "label": cfg.get("label", profile)}
@@ -704,6 +884,12 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0,
             if action_deadline is not None and time.time() > action_deadline:
                 _log(f"action wait timeout ({action_wait}s) -> return current result")
                 break
+        elif action == "trades":
+            if state.get("trades_done") or (state.get("_trades_q_done") and state.get("_orders_q_done")):
+                break
+        elif action == "depth":
+            if state.get("depth_done"):
+                break
         elif action == "instruments":
             if spi._instr_done:
                 break
@@ -711,6 +897,10 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0,
             if spi._md_done:
                 break
         else:
+            if (state["logined"] and not state["pos_done"] and spi._detail_deadline
+                    and time.time() > spi._detail_deadline):
+                # 明细回调缺失（如部分柜台/绑定不支持）时，按聚合字段兜底收口
+                spi._merge_position_detail()
             if state["logined"] and state["pos_done"]:
                 break
         time.sleep(0.1)
@@ -758,6 +948,18 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0,
         out["main_by"] = "open_interest" if with_oi else "nearest_expiry_fallback"
         out["status"] = "main_contract"
         out["ok"] = bool(main)
+        return out
+    if action == "trades":
+        out["trades"] = state.get("trades", [])
+        out["orders"] = state.get("orders", [])
+        out["trades_error"] = state.get("trades_error", "")
+        out["status"] = "trades"
+        out["ok"] = True
+        return out
+    if action == "depth":
+        out["depth"] = state.get("depth")
+        out["status"] = "depth"
+        out["ok"] = bool(state.get("depth"))
         return out
     if action == "instruments":
         insts = state.get("instruments", [])

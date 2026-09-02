@@ -2922,6 +2922,47 @@ def api_ctp_main_contract():
     }), 200
 
 
+@app.route("/api/ctp/depth", methods=["GET"])
+def api_ctp_depth():
+    """
+    GET /api/ctp/depth?instrument=au2610&profile=citic
+    精确查询单合约最新价/买卖一/涨跌停（下单前定价边界用）。子进程原生隔离。
+    """
+    instrument = (request.args.get("instrument", "") or "").strip()
+    profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
+    if not instrument:
+        return jsonify({"ok": False, "error": "缺少 instrument（合约代码，如 au2610）"}), 400
+    ok, res = _ctp_run_action("depth",
+                              {"instrument_id": instrument, "profile": profile},
+                              timeout=40.0, profile=profile)
+    if not ok or not res.get("depth"):
+        code = 503 if res.get("status") in ("timeout", "crashed", "disabled", "not_configured") else 400
+        return jsonify(res), code
+    return jsonify({"ok": True, "profile": profile, "depth": res.get("depth")}), 200
+
+
+@app.route("/api/ctp/trades", methods=["GET"])
+def api_ctp_trades():
+    """
+    GET /api/ctp/trades?instrument=au2610&profile=citic （instrument 可省略=当日全部）
+    查询当日成交流水（成交价/手数/报单编号/成交编号/开平方向）与当日委托。
+    """
+    instrument = (request.args.get("instrument", "") or "").strip()
+    profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
+    order = {"instrument_id": instrument, "profile": profile} if instrument else {"profile": profile}
+    ok, res = _ctp_run_action("trades", order, timeout=40.0, profile=profile)
+    if not ok:
+        code = 503 if res.get("status") in ("timeout", "crashed", "disabled", "not_configured") else 400
+        return jsonify(res), code
+    return jsonify({
+        "ok": True, "profile": profile,
+        "investor": res.get("investor"),
+        "trading_day": res.get("trading_day"),
+        "trades": res.get("trades", []),
+        "orders": res.get("orders", []),
+    }), 200
+
+
 @app.route("/api/<venue>/logout", methods=["POST"])
 def api_force_logout(venue):
     """强制账号登出（看穿式 3.3.4.3 云端契约端点）。
