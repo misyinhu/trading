@@ -28,12 +28,23 @@ faulthandler.enable()
 # （前置协议版本不匹配会握手 decode err，故中信必须加载 6.6.8 动态库/绑定）。
 _CTP_SWG_PATHS = {
     "simnow": r"C:\tmp\ctp_api\ctp_swig_build-6.7.11.1\ctp_api",
-    "citic": r"C:\tmp\ctp_api\ctp_swig_build-6.6.8\ctp_api",
+    # 中信看穿式(CP)评测：必须用 CP 版交易库 v6.7.7_CP + 终端采集库 WinDataCollect.dll，
+    # 否则前置握手 "Front shake hand err: decode err / Decrypt handshake data failed"。
+    "citic": r"C:\tmp\ctp_api\ctp_swig_build-6.7.7cp\ctp_api",
 }
 _profile_early = os.environ.get("CTP_PROFILE", "simnow").strip().lower()
 _CTP_SWG_PATH = _CTP_SWG_PATHS.get(_profile_early, _CTP_SWG_PATHS["simnow"])
 if Path(_CTP_SWG_PATH).exists():
     sys.path.insert(0, _CTP_SWG_PATH)
+    try:
+        os.add_dll_directory(_CTP_SWG_PATH)  # 看穿式 thosttraderapi_se 运行时加载 WinDataCollect.dll
+    except (AttributeError, OSError):
+        pass
+    # 把绑定目录并入工作目录搜索，兼容 LoadLibrary 按 cwd 找 WinDataCollect.dll
+    try:
+        os.environ["PATH"] = _CTP_SWG_PATH + os.pathsep + os.environ.get("PATH", "")
+    except Exception:  # noqa: BLE001
+        pass
 
 try:
     import thosttraderapi as T  # noqa: E402
