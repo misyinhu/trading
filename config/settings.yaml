@@ -84,6 +84,21 @@ simnow:
   auth_code: "0000000000000000"     # 官方默认认证码（16位零）
   # 账户信息从 secrets.toml 读取：
   #   SIMNOW_SIM_USER / SIMNOW_SIM_PASSWORD
+
+# 中信期货 CTP 仿真（独立券商通道，与 simnow 平级；profile=citic）
+# 与 SimNow 完全独立：?profile=citic 路由。账号/密码/认证码/AppID/前置地址
+# 优先从 secrets.toml / 环境变量读取（CITIC_CTP_*），这里只放非敏感默认与说明。
+citic:
+  label: "中信期货仿真"
+  enabled: true
+  # ↓↓↓ 以下三项需从中信「仿真/看穿式接入」资料填写（secrets 或此处均可，建议 secrets）↓↓↓
+  td_server: ""        # 交易前置，如 tcp://1.2.3.4:xxxx（中信提供）
+  md_server: ""        # 行情前置（worker 当前只用交易前置，可留空）
+  broker_id: ""        # 经纪商代码（中信提供）
+  app_id: ""           # 看穿式 AppID（中信下发；与 auth_code 配套）
+  # 认证码 auth_code、账号 user、密码 password 走 secrets：
+  #   CITIC_CTP_USER / CITIC_CTP_PASSWORD / CITIC_CTP_AUTH_CODE
+  #   CITIC_CTP_APP_ID / CITIC_CTP_BROKER_ID / CITIC_CTP_TD_SERVER / CITIC_CTP_MD_SERVER
 quant_core:
   client_id: '10'
   timeout: 30
@@ -96,8 +111,10 @@ risk_gate:
   min_correlation: 0.7
   zscore_critical: 4.0
   zscore_warn: 3.0
+  zscore_alert: 1.0   # 警报触发阈值（对应规则入场 ±1.0）
+  zscore_exit: 0.5    # 止损阈值（对应规则回归 ±0.5）
 tv_cdp:
   port: 9224
-  url: http://127.0.0.1
+  url: http://100.99.204.126
 volcengine:
   enabled: false

@@ -44,44 +44,92 @@ def _log(msg: str) -> None:
     print(f"[ctp] {msg}", file=sys.stderr, flush=True)
 
 
-def _load_config() -> dict:
-    """从 settings.yaml(simnow 块) + .streamlit/secrets.toml 读取（纯 stdlib）。"""
+# CTP 多账号 profile：simnow=官方仿真；citic=中信期货仿真（独立券商通道，与 SimNow 平级）。
+# 每个 profile 指定 settings.yaml 中的块名 + secrets.toml / 环境变量的键名。
+_PROFILES = {
+    "simnow": {
+        "block": "simnow",
+        "secrets": {"user": "SIMNOW_SIM_USER", "password": "SIMNOW_SIM_PASSWORD",
+                    "auth_code": None, "app_id": None, "broker_id": None,
+                    "td_server": None, "md_server": None},
+        "env": {"user": "SIMNOW_USER", "password": "SIMNOW_PASSWORD"},
+    },
+    "citic": {
+        "block": "citic",
+        "secrets": {"user": "CITIC_CTP_USER", "password": "CITIC_CTP_PASSWORD",
+                    "auth_code": "CITIC_CTP_AUTH_CODE", "app_id": "CITIC_CTP_APP_ID",
+                    "broker_id": "CITIC_CTP_BROKER_ID", "td_server": "CITIC_CTP_TD_SERVER",
+                    "md_server": "CITIC_CTP_MD_SERVER"},
+        "env": {"user": "CITIC_CTP_USER", "password": "CITIC_CTP_PASSWORD",
+                "auth_code": "CITIC_CTP_AUTH_CODE", "app_id": "CITIC_CTP_APP_ID",
+                "broker_id": "CITIC_CTP_BROKER_ID", "td_server": "CITIC_CTP_TD_SERVER",
+                "md_server": "CITIC_CTP_MD_SERVER"},
+    },
+}
+
+
+def _read_yaml_block(block: str) -> dict:
+    """读取 settings.yaml 顶层 `block:` 下一层缩进的 key: value（纯 stdlib，去注释/引号）。"""
     root = Path(__file__).resolve().parent.parent
     yaml_path = root / "config" / "settings.yaml"
-    secrets_path = root / ".streamlit" / "secrets.toml"
-    sn: dict = {}
-    if yaml_path.exists():
-        in_block = False
-        for raw in open(yaml_path, encoding="utf-8"):
-            body = raw.split("#", 1)[0]
-            kv = body.strip()
-            if raw.startswith("simnow:"):
-                in_block = True
-                continue
-            if in_block:
-                if kv and not raw[:1].isspace() and ":" in kv:
-                    break
-                if kv and ":" in kv:
-                    k, _, v = kv.partition(":")
-                    sn[k.strip()] = v.strip().strip('"').strip("'")
-    user = password = ""
+    out: dict = {}
+    if not yaml_path.exists():
+        return out
+    in_block = False
+    for raw in open(yaml_path, encoding="utf-8"):
+        body = raw.split("#", 1)[0]
+        kv = body.strip()
+        if raw.startswith(f"{block}:"):
+            in_block = True
+            continue
+        if in_block:
+            if kv and not raw[:1].isspace() and ":" in kv:
+                break
+            if kv and ":" in kv:
+                k, _, v = kv.partition(":")
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _load_config(profile: str = "simnow") -> dict:
+    """按 profile 从 settings.yaml 块 + .streamlit/secrets.toml + 环境变量 组装 CTP 配置。"""
+    prof = _PROFILES.get(profile, _PROFILES["simnow"])
+    blk = _read_yaml_block(prof["block"])
+    sec: dict = {}
+    secrets_path = Path(__file__).resolve().parent.parent / ".streamlit" / "secrets.toml"
     if secrets_path.exists():
         try:
             import tomllib
             sec = tomllib.load(open(secrets_path, "rb"))
-            user = sec.get("SIMNOW_SIM_USER", "")
-            password = sec.get("SIMNOW_SIM_PASSWORD", "")
         except Exception as e:  # noqa: BLE001
             _log(f"secrets read fail: {e}")
-    return {
-        "md_server": sn.get("md_server", "tcp://182.254.243.31:30011"),
-        "td_server": sn.get("td_server", "tcp://182.254.243.31:30001"),
-        "broker_id": sn.get("broker_id", "9999"),
-        "auth_code": sn.get("auth_code", "0000000000000000"),
-        "app_id": sn.get("app_id", "simnow_client_test"),
-        "user": os.environ.get("SIMNOW_USER", user),
-        "password": os.environ.get("SIMNOW_PASSWORD", password),
+
+    def _val(field: str, default: str = ""):
+        env_key = prof["env"].get(field)
+        if env_key and os.environ.get(env_key):
+            return os.environ[env_key].strip()
+        sec_key = prof["secrets"].get(field)
+        if sec_key and sec.get(sec_key):
+            return str(sec[sec_key]).strip()
+        return blk.get(field, default)
+
+    cfg = {
+        "profile": profile,
+        "md_server": _val("md_server", "tcp://182.254.243.31:30011"),
+        "td_server": _val("td_server", "tcp://182.254.243.31:30001"),
+        "broker_id": _val("broker_id", "9999"),
+        "auth_code": _val("auth_code", "0000000000000000"),
+        "app_id": _val("app_id", "simnow_client_test"),
+        "user": _val("user", ""),
+        "password": _val("password", ""),
+        "label": blk.get("label", profile),
     }
+    if profile != "simnow":
+        # 非 SimNow 账号不给 SimNow 默认值，缺什么报什么，避免误连
+        for k in ("td_server", "broker_id", "app_id", "auth_code", "user", "password"):
+            if not cfg[k] or cfg[k] in ("9999", "simnow_client_test", "0000000000000000"):
+                cfg.setdefault("_missing", []).append(k)
+    return cfg
 
 
 def _num(p, *names):
@@ -588,21 +636,31 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             self.state["error"] = f"rsp error [{err}] {msg}"
 
 
-def run(action: str = "query", order: dict | None = None, timeout: float = 30.0) -> dict:
+def run(action: str = "query", order: dict | None = None, timeout: float = 30.0,
+        profile: str | None = None) -> dict:
     global _API, _SPI, _STATE
     if not Path(_CTP_SWG_PATH).exists():
         return {"ok": False, "status": "unavailable", "error": f"CTP SWIG not found: {_CTP_SWG_PATH}"}
     if T is None:
         return {"ok": False, "status": "unavailable", "error": f"import thosttraderapi fail: {_IMP_ERR}"}
 
-    cfg = _load_config()
+    profile = (profile or os.environ.get("CTP_PROFILE", "simnow")).strip().lower()
+    if profile not in _PROFILES:
+        return {"ok": False, "status": "bad_profile", "profile": profile,
+                "error": f"未知 CTP profile={profile}，可选：{', '.join(_PROFILES)}"}
+    cfg = _load_config(profile)
+    if cfg.get("_missing"):
+        return {"ok": False, "status": "not_configured", "profile": profile, "label": cfg.get("label", profile),
+                "error": f"中信/CTP profile={profile} 缺少配置：{', '.join(cfg['_missing'])}"
+                         f"（交易前置 td_server / broker_id / app_id / 账号 / 密码 / 认证码需向券商索取后填入 secrets/环境变量）"}
     _STATE = state = {"phase": "init", "error": "", "investor": "", "trading_day": "",
                       "account": None, "positions": [], "logined": False,
                       "settled": False, "acct_done": False, "pos_done": False,
                       "front_id": 0, "session_id": 0,
                       "order_events": [], "trade_events": [], "instruments": [], "orders": [],
                       "market": {},
-                      "action_done": False, "action_result": None, "order_ref": ""}
+                      "action_done": False, "action_result": None, "order_ref": "",
+                      "profile": profile, "label": cfg.get("label", profile)}
 
     api = T.CThostFtdcTraderApi.CreateFtdcTraderApi("")
     spi = TraderSpi(api, cfg, state, action=action, order=order)
@@ -644,11 +702,13 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0)
         pass
 
     if state["phase"] == "error":
-        return {"ok": False, "status": "error", "error": state["error"] or "unknown"}
+        return {"ok": False, "status": "error", "profile": profile, "error": state["error"] or "unknown"}
     if not state["logined"]:
-        return {"ok": False, "status": "timeout", "error": f"login timeout (phase={state['phase']})"}
+        return {"ok": False, "status": "timeout", "profile": profile,
+                "error": f"login timeout (phase={state['phase']})"}
     out = {
         "ok": True, "status": "logined",
+        "profile": profile, "label": cfg.get("label", profile),
         "investor": state["investor"], "trading_day": state["trading_day"],
         "settled": state["settled"], "account": state["account"],
         "positions": state["positions"],

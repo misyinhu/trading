@@ -2014,11 +2014,16 @@ def health():
             "flag": "simnow.enabled=false（CTP 原生层未启用）",
         }
     else:
-        cached = _ctp_snapshot_cache.get("data")
+        cached = (_ctp_snapshot_cache.get("simnow") or {}).get("data")
         components["simnow"] = {
             "status": (cached.get("status") if cached else "standby"),
             "flag": "子进程隔离 worker（按需 /api/ctp/account?force=1 触发）",
         }
+    citic_cached = (_ctp_snapshot_cache.get("citic") or {}).get("data")
+    components["ctp_citic"] = {
+        "status": (citic_cached.get("status") if citic_cached else "standby"),
+        "flag": "中信期货仿真 profile=citic（/api/ctp/account?profile=citic）",
+    }
 
     status_code = 200 if overall == "ok" else 503
     return jsonify({"status": overall, "components": components}), status_code
@@ -2479,35 +2484,44 @@ def _get_okx_trader():
     return app._okx_trader
 
 
-_ctp_snapshot_cache = {"ts": 0.0, "data": None}
+_ctp_snapshot_cache: dict = {}   # profile -> {"ts": float, "data": dict}
 _CTP_SNAPSHOT_TTL = 20.0  # 秒：账户/持仓快照缓存，避免每次请求都 spawn 原生子进程
 _ctp_snap_lock = threading.Lock()
+_CTP_PROFILES = ("simnow", "citic")
 
 
-def _ctp_snapshot(force: bool = False, timeout: float = 30.0):
+def _ctp_norm_profile(p) -> str:
+    p = (p or "simnow").strip().lower()
+    return p if p in _CTP_PROFILES else "simnow"
+
+
+def _ctp_snapshot(force: bool = False, timeout: float = 30.0, profile: str = "simnow"):
     """在独立子进程运行 CTP worker，返回账户+持仓快照 dict。
 
     CTP SWIG 原生层若崩溃，只会终止子进程（非零退出），主 Flask 不受影响。
-    返回: (ok: bool, payload: dict)。
+    profile=simnow（官方仿真）/ citic（中信期货仿真）。返回: (ok: bool, payload: dict)。
     """
-    if not _simnow_enabled():
+    if profile == "simnow" and not _simnow_enabled():
         return False, {"error": "SimNow/CTP 原生层未启用（simnow.enabled=false）", "status": "disabled"}
     now = time.time()
     with _ctp_snap_lock:
-        if not force and _ctp_snapshot_cache["data"] is not None and                 now - _ctp_snapshot_cache["ts"] < _CTP_SNAPSHOT_TTL:
-            data = _ctp_snapshot_cache["data"]
+        slot = _ctp_snapshot_cache.setdefault(profile, {"ts": 0.0, "data": None})
+        if not force and slot["data"] is not None and now - slot["ts"] < _CTP_SNAPSHOT_TTL:
+            data = slot["data"]
             return bool(data.get("ok")), data
     worker = Path(PROJECT_ROOT) / "simnow_client" / "ctp_worker.py"
     try:
         proc = subprocess.run(
             [sys.executable, "-u", str(worker)],
             cwd=PROJECT_ROOT, capture_output=True, text=True,
-            timeout=timeout,
+            timeout=timeout, env={**os.environ, "CTP_PROFILE": profile},
         )
     except subprocess.TimeoutExpired:
-        return False, {"ok": False, "status": "timeout", "error": f"CTP 子进程超时（{timeout}s）"}
+        return False, {"ok": False, "status": "timeout", "profile": profile,
+                       "error": f"CTP 子进程超时（{timeout}s）"}
     except Exception as e:  # noqa: BLE001
-        return False, {"ok": False, "status": "error", "error": f"启动 CTP 子进程失败: {e}"}
+        return False, {"ok": False, "status": "error", "profile": profile,
+                       "error": f"启动 CTP 子进程失败: {e}"}
     result = None
     for line in (proc.stdout or "").splitlines():
         if line.startswith("RESULT_JSON="):
@@ -2519,27 +2533,27 @@ def _ctp_snapshot(force: bool = False, timeout: float = 30.0):
         # 子进程原生崩溃：exit 非零且无 JSON
         tail = (proc.stderr or "").strip().splitlines()
         tail = tail[-3:] if tail else []
-        return False, {"ok": False, "status": "crashed",
+        return False, {"ok": False, "status": "crashed", "profile": profile,
                        "error": f"CTP 原生子进程异常退出（exit={proc.returncode}）" +
                                 (f"；最后日志: {' | '.join(tail)}" if tail else "")}
     with _ctp_snap_lock:
-        _ctp_snapshot_cache["ts"] = time.time()
-        _ctp_snapshot_cache["data"] = result
+        _ctp_snapshot_cache[profile] = {"ts": time.time(), "data": result}
     return bool(result.get("ok")), result
 
 
-def _ctp_run_action(action: str, order: dict, timeout: float = 40.0):
+def _ctp_run_action(action: str, order: dict, timeout: float = 40.0, profile: str = "simnow"):
     """在独立子进程运行 CTP 报单/撤单动作（原生崩溃只杀子进程）。
 
     返回 (ok: bool, payload: dict)。报单/撤单不走快照缓存。
     """
-    if not _simnow_enabled():
+    if profile == "simnow" and not _simnow_enabled():
         return False, {"ok": False, "status": "disabled",
                        "error": "SimNow/CTP 原生层未启用（simnow.enabled=false）"}
     worker = Path(PROJECT_ROOT) / "simnow_client" / "ctp_worker.py"
     env = dict(os.environ)
     env["CTP_ACTION"] = action
     env["CTP_ORDER_JSON"] = json.dumps(order or {}, ensure_ascii=False)
+    env["CTP_PROFILE"] = profile
     try:
         proc = subprocess.run(
             [sys.executable, "-u", str(worker)],
@@ -2767,17 +2781,20 @@ def api_ctp_account():
     走独立子进程 worker（原生崩溃不影响主服务）。?force=1 跳过缓存。
     """
     force = request.args.get("force") in ("1", "true", "yes")
-    ok, snap = _ctp_snapshot(force=force)
+    profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
+    ok, snap = _ctp_snapshot(force=force, profile=profile)
     if not ok:
-        code = 503 if snap.get("status") in ("timeout", "crashed", "logined_false") else 500
+        code = 503 if snap.get("status") in ("timeout", "crashed", "logined_false",
+                                             "not_configured", "disabled") else 500
         return jsonify({"error": snap.get("error") or "account data not available",
-                        "status": snap.get("status", "error")}), code
+                        "status": snap.get("status", "error"), "profile": profile}), code
     acc = snap.get("account")
     if not acc:
         return jsonify({"error": "account data not available yet, try again shortly",
-                        "status": snap.get("status")}), 503
+                        "status": snap.get("status"), "profile": profile}), 503
     return jsonify({"account": acc, "status": snap.get("status"),
-                    "investor": snap.get("investor"), "trading_day": snap.get("trading_day")})
+                    "investor": snap.get("investor"), "trading_day": snap.get("trading_day"),
+                    "profile": profile, "label": snap.get("label", profile)})
 
 
 @app.route("/api/ctp/positions", methods=["GET"])
@@ -2786,14 +2803,16 @@ def api_ctp_positions():
     GET /api/ctp/positions — SimNow 期货当前持仓。
     """
     force = request.args.get("force") in ("1", "true", "yes")
-    ok, snap = _ctp_snapshot(force=force)
+    profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
+    ok, snap = _ctp_snapshot(force=force, profile=profile)
     if not ok:
-        code = 503 if snap.get("status") in ("timeout", "crashed") else 500
+        code = 503 if snap.get("status") in ("timeout", "crashed", "not_configured", "disabled") else 500
         return jsonify({"error": snap.get("error") or "positions not available",
-                        "status": snap.get("status", "error"), "positions": []}), code
+                        "status": snap.get("status", "error"), "positions": [],
+                        "profile": profile}), code
     positions = snap.get("positions", [])
     return jsonify({"positions": positions, "count": len(positions),
-                    "status": snap.get("status")})
+                    "status": snap.get("status"), "profile": profile})
 
 
 @app.route("/api/ctp/order", methods=["POST"])
@@ -2812,6 +2831,8 @@ def api_ctp_order():
     }
     """
     body = request.get_json(silent=True) or {}
+    profile = _ctp_norm_profile(body.get("profile") or body.get("account")
+                                or request.args.get("profile") or request.args.get("account"))
     required = ["instrument_id"]
     missing = [k for k in required if not body.get(k)]
     if missing:
@@ -2820,8 +2841,8 @@ def api_ctp_order():
         return jsonify({"ok": False, "error": "限价单必须提供 price>0"}), 400
     if int(float(body.get("volume", 0) or 0)) <= 0:
         return jsonify({"ok": False, "error": "volume 必须为正整数"}), 400
-    ok, res = _ctp_run_action("order", body)
-    code = 200 if ok else (503 if res.get("status") in ("timeout", "crashed", "disabled") else 400)
+    ok, res = _ctp_run_action("order", body, profile=profile)
+    code = 200 if ok else (503 if res.get("status") in ("timeout", "crashed", "disabled", "not_configured") else 400)
     return jsonify(res), code
 
 
@@ -2837,6 +2858,8 @@ def api_ctp_cancel():
     order_ref/front_id/session_id 均来自 /api/ctp/order 报单返回的 action_result。
     """
     body = request.get_json(silent=True) or {}
+    profile = _ctp_norm_profile(body.get("profile") or body.get("account")
+                                or request.args.get("profile") or request.args.get("account"))
     if not body.get("instrument_id"):
         return jsonify({"ok": False, "error": "缺少 instrument_id"}), 400
     has_sysid = bool(body.get("order_sys_id"))
@@ -2844,8 +2867,8 @@ def api_ctp_cancel():
     if not (has_sysid or has_ref):
         return jsonify({"ok": False,
                         "error": "需提供 order_ref(+front_id/session_id)（推荐）或 order_sys_id"}), 400
-    ok, res = _ctp_run_action("cancel", body)
-    code = 200 if ok else (503 if res.get("status") in ("timeout", "crashed", "disabled") else 400)
+    ok, res = _ctp_run_action("cancel", body, profile=profile)
+    code = 200 if ok else (503 if res.get("status") in ("timeout", "crashed", "disabled", "not_configured") else 400)
     return jsonify(res), code
 
 
@@ -2858,12 +2881,13 @@ def api_ctp_instruments():
     """
     product = (request.args.get("product", "") or "").strip()
     exchange = (request.args.get("exchange", "") or "").strip()
+    profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
     if not product:
         return jsonify({"ok": False, "error": "缺少 product（品种字母代码，如 IC/IF/AU）"}), 400
     ok, res = _ctp_run_action("instruments",
                               {"product": product, "exchange_id": exchange},
-                              timeout=40.0)
-    code = 200 if ok else (503 if res.get("status") in ("timeout", "crashed", "disabled") else 400)
+                              timeout=40.0, profile=profile)
+    code = 200 if ok else (503 if res.get("status") in ("timeout", "crashed", "disabled", "not_configured") else 400)
     return jsonify(res), code
 
 
@@ -2877,23 +2901,77 @@ def api_ctp_main_contract():
     """
     product = (request.args.get("product", "") or "").strip()
     exchange = (request.args.get("exchange", "") or "").strip()
+    profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
     if not product:
         return jsonify({"ok": False, "error": "缺少 product（如 IC）"}), 400
     ok, res = _ctp_run_action("main_contract",
                               {"product": product, "exchange_id": exchange},
-                              timeout=45.0)
+                              timeout=45.0, profile=profile)
     if not ok:
-        code = 503 if res.get("status") in ("timeout", "crashed", "disabled") else 400
+        code = 503 if res.get("status") in ("timeout", "crashed", "disabled", "not_configured") else 400
         return jsonify(res), code
     return jsonify({
         "ok": True, "product": product.upper(),
         "exchange": exchange.upper() or None,
+        "profile": profile,
         "main_by": res.get("main_by", "open_interest"),
         "main_contract": res.get("main_contract"),
         "front_contract": res.get("front_contract"),
         "instruments": res.get("instruments", []),
         "tradable_count": res.get("tradable_count", 0),
     }), 200
+
+
+@app.route("/api/ib/order", methods=["POST"])
+def api_ib_order():
+    """
+    POST /api/ib/order — IB paper 期货/股票模拟下单（复用 TWS/Gateway 连接）。
+    Body: {"symbol":"MNQ","action":"BUY|SELL|CLOSE","quantity":1,
+           "sec_type":"FUT","exchange":null,"close_position":false}
+    走 OrderManager.place + RiskGate(ADVISORY)，后台线程提交（避免事件循环嵌套死锁），
+    与飞书人工下单同一路径。同步等待 <=65s。
+    """
+    body = request.get_json(silent=True) or {}
+    symbol = (body.get("symbol") or "").strip().upper()
+    action = (body.get("action") or "BUY").strip().upper()
+    close_position = bool(body.get("close_position", action == "CLOSE"))
+    qty = float(body.get("quantity", 0) or 0)
+    if not symbol:
+        return jsonify({"ok": False, "error": "缺少 symbol（如 MNQ/GC）"}), 400
+    if not close_position and qty <= 0:
+        return jsonify({"ok": False, "error": "quantity 必须为正数（CLOSE 除外）"}), 400
+
+    try:
+        from client.ib_connection import get_ib_connection
+        ib = get_ib_connection()
+        if ib is None or not ib.isConnected():
+            return jsonify({"ok": False, "status": "ib_disconnected",
+                            "error": "IB Gateway 未连接"}), 503
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "status": "ib_error",
+                        "error": f"IB 连接异常: {e}"}), 503
+
+    sec_type = body.get("sec_type") or "FUT"
+    exchange = body.get("exchange")
+    try:
+        future = _submit_order_in_background(
+            ib, symbol, action, qty,
+            exchange=exchange, sec_type=sec_type,
+            close_position=close_position,
+        )
+        res = future.result(timeout=65)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[IB-ORDER] %s %s %s 失败: %s", action, symbol, qty, e)
+        return jsonify({"ok": False, "status": "error",
+                        "error": f"{type(e).__name__}: {e}"}), 503
+
+    if res is None:
+        return jsonify({"ok": False, "status": "timeout", "error": "Order timed out"}), 504
+    status = str(res.get("status", "")).lower()
+    ok = status in ("filled", "submitted", "ok", "pending") and not res.get("error")
+    logger.info("[IB-ORDER] %s %s %s -> %s", action, symbol, qty, res.get("status"))
+    return jsonify({"ok": ok, "status": res.get("status", "submitted"),
+                    "action_result": res}), 200
 
 
 @app.route("/api/okx/account", methods=["GET"])
