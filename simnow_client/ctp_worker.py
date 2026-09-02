@@ -24,7 +24,14 @@ from pathlib import Path
 
 faulthandler.enable()
 
-_CTP_SWG_PATH = r"C:\tmp\ctp_api\ctp_swig_build-6.7.11.1\ctp_api"
+# CTP API 版本随账号 profile 不同：SimNow 用 6.7.11.1；中信评测柜台用 6.6.8
+# （前置协议版本不匹配会握手 decode err，故中信必须加载 6.6.8 动态库/绑定）。
+_CTP_SWG_PATHS = {
+    "simnow": r"C:\tmp\ctp_api\ctp_swig_build-6.7.11.1\ctp_api",
+    "citic": r"C:\tmp\ctp_api\ctp_swig_build-6.6.8\ctp_api",
+}
+_profile_early = os.environ.get("CTP_PROFILE", "simnow").strip().lower()
+_CTP_SWG_PATH = _CTP_SWG_PATHS.get(_profile_early, _CTP_SWG_PATHS["simnow"])
 if Path(_CTP_SWG_PATH).exists():
     sys.path.insert(0, _CTP_SWG_PATH)
 
