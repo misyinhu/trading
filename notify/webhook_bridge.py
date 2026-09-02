@@ -2922,6 +2922,61 @@ def api_ctp_main_contract():
     }), 200
 
 
+@app.route("/api/<venue>/logout", methods=["POST"])
+def api_force_logout(venue):
+    """强制账号登出（看穿式 3.3.4.3 云端契约端点）。
+
+    quant-agent 合规门在本地先冻结该账号交易权限，再调本端点断开柜台连接。
+      - ib : 断开持久化 TWS/Gateway 连接（manager.stop + ib.disconnect）。
+      - ctp: 子进程即连即断（每次动作退出即 api.Release），无常驻会话；
+             若存在进程内复用 trader 则显式 disconnect。
+      - okx/gm: 无状态 REST，无常驻会话，按成功处理。
+    Body: {"account":"...","reason":"..."}
+    返回 {"ok":true,"venue":...,"action":"logout","detail":...}。
+    """
+    v = (venue or "").strip().lower()
+    body = request.get_json(force=True, silent=True) or {}
+    detail = ""
+    try:
+        if v == "ib":
+            try:
+                from client.ib_connection import get_ib_connection, get_ib_manager
+                ib = get_ib_connection()
+                if ib is not None and getattr(ib, "isConnected", lambda: False)():
+                    ib.disconnect()
+                    detail = "IB 连接已断开"
+                try:
+                    get_ib_manager().disconnect()
+                except Exception:
+                    pass
+                if not detail:
+                    detail = "IB 当前无活动连接（已确保断开）"
+            except Exception as e:  # noqa: BLE001
+                return jsonify({"ok": False, "venue": v, "action": "logout",
+                                "error": f"IB 断开失败: {e}"}), 500
+        elif v == "ctp":
+            tr = getattr(app, "_simnow_trader", None)
+            if tr is not None:
+                try:
+                    tr.disconnect()
+                    detail = "进程内 CTP trader 已 disconnect"
+                except Exception as e:  # noqa: BLE001
+                    detail = f"trader disconnect 异常（子进程模型通常无常驻会话）: {e}"
+            else:
+                detail = "CTP 子进程即连即断，无常驻会话；强制登出以 quant-agent 本地冻结为准"
+        elif v in ("okx", "gm"):
+            detail = f"{v.upper()} 为无状态 REST，无常驻柜台会话"
+        else:
+            return jsonify({"ok": False, "venue": v, "action": "logout",
+                            "error": f"unknown venue: {v}"}), 400
+        return jsonify({"ok": True, "venue": v, "action": "logout",
+                        "account": body.get("account", ""),
+                        "reason": body.get("reason", ""), "detail": detail}), 200
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "venue": v, "action": "logout",
+                        "error": str(e)}), 500
+
+
 @app.route("/api/ib/order", methods=["POST"])
 def api_ib_order():
     """
