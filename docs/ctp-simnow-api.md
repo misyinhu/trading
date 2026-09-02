@@ -19,6 +19,25 @@
 | 报单/撤单超时 | 60s（子进程：登录→结算→请求→等回报）|
 | 账户/持仓缓存 | 20s，`?force=1` 跳过缓存强制重登重查 |
 
+## 多账号 profile（SimNow / 中信期货仿真）
+
+CTP 通道支持两个独立仿真账号，由 `profile` 参数选择（查询用 query 参数、报单/撤单用 body 字段，
+键名 `profile` 或 `account` 均可）：
+
+| profile | 通道 | 配置来源 | 状态 |
+|---|---|---|---|
+| `simnow`（默认） | 官方 SimNow 第一套环境 `182.254.243.31` | `SIMNOW_SIM_*` | ✅ 已通（账号 274467）|
+| `citic` | 中信期货评测柜台 电信 `tcp://101.226.254.149:53205`、联通 `tcp://140.206.167.53:53205`；BrokerID `66666`；AppID `client_quagent_1.0` | `CITIC_CTP_*` | ⚠️ 配置就位，握手阻塞 |
+
+示例：`GET /api/ctp/account?profile=citic&force=1`；报单 body 加 `"profile":"citic"`。
+
+> **已知阻塞（中信）**：前置握手返回 `rsp error [4040] CTP:API Front shake hand err: decode err`，
+> 电信/联通两条线路一致。TCP 已连通、账号/密码/认证码/AppID/BrokerID/前置均已写入，判断为
+> **本机 CTP API 库（SWIG 6.7.11.1，为 SimNow 构建）与中信评测柜台协议版本不匹配**。
+> 需取中信「看穿式接入指引」中与该 AppID 配套的 **CTP API 版本 / 动态库（thosttraderapi_se.dll 等）**，
+> 用该版本重建 SWIG 后重试；与应用层代码无关。配置在 winclaw
+> `C:\projects\trading\.streamlit\secrets.toml` 的 `CITIC_CTP_*`。
+
 ## 接口清单
 
 | 方法 | 路径 | 说明 |
