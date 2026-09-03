@@ -33,7 +33,7 @@ import yaml
 
 # 添加配置路径
 # 绝对路径：以 `python notify\webhook_bridge.py` 相对方式启动时 __file__ 非绝对，
-# 用 abspath 保证无论当前工作目录在哪都能定位 config/、simnow_client/ 等资源。
+# 用 abspath 保证无论当前工作目录在哪都能定位 config/、ctp_client/ 等资源。
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 from config import (
@@ -2509,7 +2509,7 @@ def _ctp_snapshot(force: bool = False, timeout: float = 30.0, profile: str = "si
         if not force and slot["data"] is not None and now - slot["ts"] < _CTP_SNAPSHOT_TTL:
             data = slot["data"]
             return bool(data.get("ok")), data
-    worker = Path(PROJECT_ROOT) / "simnow_client" / "ctp_worker.py"
+    worker = Path(PROJECT_ROOT) / "ctp_client" / "ctp_worker.py"
     try:
         proc = subprocess.run(
             [sys.executable, "-u", str(worker)],
@@ -2549,7 +2549,7 @@ def _ctp_run_action(action: str, order: dict, timeout: float = 40.0, profile: st
     if profile == "simnow" and not _simnow_enabled():
         return False, {"ok": False, "status": "disabled",
                        "error": "SimNow/CTP 原生层未启用（simnow.enabled=false）"}
-    worker = Path(PROJECT_ROOT) / "simnow_client" / "ctp_worker.py"
+    worker = Path(PROJECT_ROOT) / "ctp_client" / "ctp_worker.py"
     env = dict(os.environ)
     env["CTP_ACTION"] = action
     env["CTP_ORDER_JSON"] = json.dumps(order or {}, ensure_ascii=False)
@@ -2589,7 +2589,7 @@ def _get_simnow_trader(timeout: float = 10.0):
     if not _simnow_enabled():
         raise RuntimeError("SimNow/CTP 原生层未启用（simnow.enabled=false）")
     if not hasattr(app, "_simnow_trader") or getattr(app, "_simnow_trader", None) is None:
-        from simnow_client.trader import SimNowTrader
+        from ctp_client.trader import SimNowTrader
         app._simnow_trader = SimNowTrader()
     trader = app._simnow_trader
     if not trader.is_connected():

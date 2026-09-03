@@ -24,7 +24,7 @@ if _WINCLOW:
     sys.path.insert(0, _CTP_SWG_PATH)
     from thosttraderapi import CThostFtdcTraderApi, CThostFtdcTraderSpi
     from thostmduserapi import CThostFtdcMdApi, CThostFtdcMdSpi
-    from simnow_client.ctp_connector import CtpMdConnector, CtpTdConnector, CtpConfig, ConnectionStatus
+    from ctp_client.ctp_connector import CtpMdConnector, CtpTdConnector, CtpConfig, ConnectionStatus
 else:
     CtpMdConnector = CtpTdConnector = CtpConfig = ConnectionStatus = None
 
