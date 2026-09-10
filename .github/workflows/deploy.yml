@@ -83,14 +83,11 @@ jobs:
             )
             ($eco -join "`n") | Set-Content -Encoding UTF8 ecosystem.config.js
           }
-          pm2 restart ${{ env.SERVICE_NAME }} --update-env 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            pm2 start ecosystem.config.js
-            if ($LASTEXITCODE -eq 0) { pm2 save }
-          }
-          $global:LASTEXITCODE = 0
+          # cmd 承接 exit code，避免 pm2 把 "process not found" 写进 stderr
+          # 触发 PowerShell EAP=Stop（restart 不存在等价于首次 start）
+          cmd /c "pm2 restart ${{ env.SERVICE_NAME }} --update-env || (pm2 start ecosystem.config.js && pm2 save)"
           Start-Sleep -Seconds 8
-          pm2 list
+          cmd /c "pm2 list"
 
       - name: Health check
         run: |
