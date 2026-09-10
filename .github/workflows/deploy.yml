@@ -26,7 +26,6 @@ jobs:
           fetch-depth: 1
 
       - name: Sync code to production
-        shell: pwsh
         run: |
           $src = "${{ github.workspace }}"
           $dst = "${{ env.DEPLOY_PATH }}"
@@ -44,14 +43,12 @@ jobs:
           Write-Host "Sync done."
 
       - name: Install python deps
-        shell: pwsh
         run: |
           & ${{ env.PY }} -m pip install --quiet --disable-pip-version-check `
             flask requests pyyaml ib_insync schedule psutil
           Write-Host "deps ok"
 
       - name: Prepare gm_env (掘金 SDK 隔离 venv)
-        shell: pwsh
         run: |
           $gmPy = "C:\projects\gm_env\Scripts\python.exe"
           if (-not (Test-Path $gmPy)) {
@@ -62,7 +59,6 @@ jobs:
           & $gmPy -c "import google.protobuf,sys; print('protobuf', google.protobuf.__version__)"
 
       - name: Restart service (PM2)
-        shell: pwsh
         run: |
           Set-Location "${{ env.DEPLOY_PATH }}"
           if (-not (Test-Path "ecosystem.config.js")) {
@@ -89,7 +85,6 @@ jobs:
           pm2 list
 
       - name: Health check
-        shell: pwsh
         run: |
           $url = "http://127.0.0.1:${{ env.SERVER_PORT }}/health"
           $ok = $false
@@ -109,7 +104,6 @@ jobs:
           }
 
       - name: Smoke test
-        shell: pwsh
         run: |
           $tests = @(
             @{ url = "http://127.0.0.1:5002/api/gm/history?symbol=SHSE.600000&frequency=1d"; name = "gm history" },
