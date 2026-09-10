@@ -51,7 +51,12 @@ jobs:
       - name: Prepare gm_env (掘金 SDK 隔离 venv)
         run: |
           $gmPy = "C:\projects\gm_env\Scripts\python.exe"
-          if (-not (Test-Path $gmPy)) {
+          $gmReady = $false
+          if (Test-Path $gmPy) {
+            & $gmPy -c "import gm" 2>$null
+            $gmReady = ($LASTEXITCODE -eq 0)
+          }
+          if (-not $gmReady) {
             & ${{ env.PY }} -m venv C:\projects\gm_env
             & C:\projects\gm_env\Scripts\python.exe -m pip install --quiet --disable-pip-version-check `
               -i https://pypi.tuna.tsinghua.edu.cn/simple "gm==3.0.186" "protobuf==3.20.3"
