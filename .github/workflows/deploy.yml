@@ -31,7 +31,7 @@ jobs:
           $dst = "${{ env.DEPLOY_PATH }}"
           New-Item -ItemType Directory -Force -Path $dst | Out-Null
           # 运行时需要的源码目录（逐目录 /MIR；secrets/日志/缓存不在其中，不会被删）
-          $dirs = @("notify","client","config","ctp_client","gm_client","account","orders")
+          $dirs = @("notify","client","config","ctp_client","gm_client","okx_client","account","orders")
           foreach ($d in $dirs) {
             if (Test-Path "$src\$d") {
               & robocopy "$src\$d" "$dst\$d" /MIR /NFL /NDL /NJH /NJS /NP /R:2 /W:3 `
