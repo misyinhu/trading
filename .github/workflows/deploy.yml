@@ -1,0 +1,120 @@
+name: Deploy trading bridge to cxclaw
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  DEPLOY_PATH: D:\projects\trading
+  SERVER_PORT: 5002
+  SERVICE_NAME: trading-bridge
+  PY: C:\Users\Apple\AppData\Local\Programs\Python\Python312\python.exe
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, windows, cxclaw]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Sync code to production
+        shell: pwsh
+        run: |
+          $src = "${{ github.workspace }}"
+          $dst = "${{ env.DEPLOY_PATH }}"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          # 运行时需要的源码目录（逐目录 /MIR；secrets/日志/缓存不在其中，不会被删）
+          $dirs = @("notify","client","config","ctp_client","gm_client","account","orders")
+          foreach ($d in $dirs) {
+            if (Test-Path "$src\$d") {
+              & robocopy "$src\$d" "$dst\$d" /MIR /NFL /NDL /NJH /NJS /NP /R:2 /W:3 `
+                /XD "__pycache__" ".pytest_cache" /XF "*.pyc"
+              if ($LASTEXITCODE -ge 8) { throw "robocopy $d failed ($LASTEXITCODE)" }
+              $global:LASTEXITCODE = 0
+            }
+          }
+          Write-Host "Sync done."
+
+      - name: Install python deps
+        shell: pwsh
+        run: |
+          & ${{ env.PY }} -m pip install --quiet --disable-pip-version-check `
+            flask requests pyyaml ib_insync schedule psutil
+          Write-Host "deps ok"
+
+      - name: Prepare gm_env (掘金 SDK 隔离 venv)
+        shell: pwsh
+        run: |
+          $gmPy = "C:\projects\gm_env\Scripts\python.exe"
+          if (-not (Test-Path $gmPy)) {
+            & ${{ env.PY }} -m venv C:\projects\gm_env
+            & C:\projects\gm_env\Scripts\python.exe -m pip install --quiet --disable-pip-version-check "gm==3.0.186" "protobuf==3.20.3"
+          }
+          Copy-Item "${{ env.DEPLOY_PATH }}\gm_client\gmsim_worker.py" "C:\projects\gm_env\gmsim_worker.py" -Force
+          & $gmPy -c "import google.protobuf,sys; print('protobuf', google.protobuf.__version__)"
+
+      - name: Restart service (PM2)
+        shell: pwsh
+        run: |
+          Set-Location "${{ env.DEPLOY_PATH }}"
+          if (-not (Test-Path "ecosystem.config.js")) {
+            @'
+          module.exports = {
+            apps: [{
+              name: 'trading-bridge',
+              script: 'C:/Users/Apple/AppData/Local/Programs/Python/Python312/python.exe',
+              args: 'notify/webhook_bridge.py 5002',
+              cwd: 'D:/projects/trading',
+              env: { NODE_ENV: 'production', PYTHONIOENCODING: 'utf-8' }
+            }]
+          }
+'@ | Set-Content -Encoding UTF8 ecosystem.config.js
+          }
+          pm2 restart ${{ env.SERVICE_NAME }} --update-env 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            pm2 start ecosystem.config.js
+            if ($LASTEXITCODE -eq 0) { pm2 save }
+          }
+          $global:LASTEXITCODE = 0
+          Start-Sleep -Seconds 8
+          pm2 list
+
+      - name: Health check
+        shell: pwsh
+        run: |
+          $url = "http://127.0.0.1:${{ env.SERVER_PORT }}/health"
+          $ok = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5
+              if ($r.StatusCode -eq 200) {
+                Write-Host "Service healthy after $(( $i + 1 ) * 2) seconds"
+                $ok = $true; break
+              }
+            } catch { Write-Host "  Attempt $(( $i + 1 )): $($_.Exception.Message)" }
+          }
+          if (-not $ok) {
+            pm2 logs ${{ env.SERVICE_NAME }} --lines 40 --nostream
+            exit 1
+          }
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $tests = @(
+            @{ url = "http://127.0.0.1:5002/api/gm/history?symbol=SHSE.600000&frequency=1d"; name = "gm history" },
+            @{ url = "http://127.0.0.1:5002/health/full"; name = "health full" }
+          )
+          foreach ($t in $tests) {
+            try {
+              $r = Invoke-WebRequest -Uri $t.url -UseBasicParsing -TimeoutSec 60
+              Write-Host ("[{0}] {1}: {2}" -f $(if ($r.StatusCode -eq 200) {"PASS"} else {"FAIL"}), $t.name, $r.Content.Substring(0, [Math]::Min(200, $r.Content.Length)))
+            } catch {
+              Write-Host "[FAIL] $($t.name): $($_.Exception.Message)"
+            }
+          }
