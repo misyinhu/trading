@@ -111,7 +111,7 @@ jobs:
       - name: Smoke test
         run: |
           $tests = @(
-            @{ url = "http://127.0.0.1:5002/api/gm/history?symbol=SHSE.600000&frequency=1d"; name = "gm history" },
+            @{ url = "http://127.0.0.1:5002/api/gm/history?symbol=SHSE.600000&frequency=1d&start_time=2026-08-01&end_time=2026-09-09"; name = "gm history" },
             @{ url = "http://127.0.0.1:5002/health/full"; name = "health full" }
           )
           foreach ($t in $tests) {
