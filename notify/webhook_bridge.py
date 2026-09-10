@@ -7,11 +7,20 @@ TradingView Webhook -> 飞书 中转服务
 import os
 import sys
 
-# 直连，不使用代理
+# 默认直连；部署在无国际出口的机器上时，用 OUTBOUND_PROXY 显式指定上游代理
 os.environ.pop("HTTP_PROXY", None)
 os.environ.pop("HTTPS_PROXY", None)
 os.environ.pop("http_proxy", None)
 os.environ.pop("https_proxy", None)
+_outbound_proxy = os.environ.get("OUTBOUND_PROXY", "").strip()
+if _outbound_proxy:
+    for _proxy_key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        os.environ[_proxy_key] = _outbound_proxy
+    os.environ.setdefault(
+        "NO_PROXY",
+        "localhost,127.0.0.1,::1,100.82.238.11,100.80.148.2,100.99.204.126",
+    )
+    os.environ.setdefault("no_proxy", os.environ["NO_PROXY"])
 
 # 首先应用 nest_asyncio patch（必须在导入 ib_insync 之前）
 try:
@@ -2313,7 +2322,9 @@ def api_tv_prices():
         "SILVER": ["TVC:SILVER"],
     }
 
-    proxy_handler = urllib.request.ProxyHandler({"https": "http://127.0.0.1:7890"})
+    proxy_handler = urllib.request.ProxyHandler(
+        {"https": _outbound_proxy} if _outbound_proxy else {}
+    )
     opener = urllib.request.build_opener(proxy_handler)
 
     # 收集所有需要查询的 TV ticker（用 symbols.tickers 精确查询，跳过 regex filter）

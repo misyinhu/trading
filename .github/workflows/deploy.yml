@@ -77,7 +77,11 @@ jobs:
               "    script: 'C:/Users/Apple/AppData/Local/Programs/Python/Python312/python.exe',"
               "    args: 'notify/webhook_bridge.py 5002',"
               "    cwd: 'D:/projects/trading',"
-              "    env: { NODE_ENV: 'production', PYTHONIOENCODING: 'utf-8' }"
+              "    env: {"
+              "      NODE_ENV: 'production',"
+              "      PYTHONIOENCODING: 'utf-8',"
+              "      OUTBOUND_PROXY: 'http://100.80.148.2:7890'"
+              "    }"
               "  }]"
               "};"
             )
