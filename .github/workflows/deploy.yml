@@ -14,6 +14,10 @@ env:
 jobs:
   deploy:
     runs-on: [self-hosted, windows, cxclaw]
+    env:
+      # cxclaw 出网：系统 gitconfig 把 https 改写成 ssh；首次 clone 时 includeIf
+      # 尚未生效，必须显式指定本仓 deploy key
+      GIT_SSH_COMMAND: ssh -i C:/Users/Apple/.ssh/id_ed25519_trading -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
 
     steps:
       - name: Checkout code
