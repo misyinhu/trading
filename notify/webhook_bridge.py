@@ -2669,6 +2669,12 @@ def _gm_run(action: str, order: dict | None = None, timeout: float = 45.0,
         "token=os.environ['GM_TOKEN'], serv_addr=os.environ['GM_SERV_ADDR'])"
     )
     env = dict(os.environ)
+    # gm 原生 SDK 直连本机掘金终端，代理环境会导致其原生层崩溃
+    for _proxy_env_key in (
+        "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+        "ALL_PROXY", "all_proxy",
+    ):
+        env.pop(_proxy_env_key, None)
     cred = _gm_credentials()
     env["GM_TOKEN"] = cred["token"]
     env["GM_ACCOUNT"] = cred["account"]
