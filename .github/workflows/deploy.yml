@@ -53,8 +53,10 @@ jobs:
           $gmPy = "C:\projects\gm_env\Scripts\python.exe"
           $gmReady = $false
           if (Test-Path $gmPy) {
-            & $gmPy -c "import gm" 2>$null
-            $gmReady = ($LASTEXITCODE -eq 0)
+            try {
+              & $gmPy -c "import gm" 2>&1 | Out-Null
+              $gmReady = ($LASTEXITCODE -eq 0)
+            } catch { $gmReady = $false }
           }
           if (-not $gmReady) {
             & ${{ env.PY }} -m venv C:\projects\gm_env
