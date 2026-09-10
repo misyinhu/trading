@@ -62,17 +62,18 @@ jobs:
         run: |
           Set-Location "${{ env.DEPLOY_PATH }}"
           if (-not (Test-Path "ecosystem.config.js")) {
-            @'
-          module.exports = {
-            apps: [{
-              name: 'trading-bridge',
-              script: 'C:/Users/Apple/AppData/Local/Programs/Python/Python312/python.exe',
-              args: 'notify/webhook_bridge.py 5002',
-              cwd: 'D:/projects/trading',
-              env: { NODE_ENV: 'production', PYTHONIOENCODING: 'utf-8' }
-            }]
-          }
-'@ | Set-Content -Encoding UTF8 ecosystem.config.js
+            $eco = @(
+              "module.exports = {"
+              "  apps: [{"
+              "    name: 'trading-bridge',"
+              "    script: 'C:/Users/Apple/AppData/Local/Programs/Python/Python312/python.exe',"
+              "    args: 'notify/webhook_bridge.py 5002',"
+              "    cwd: 'D:/projects/trading',"
+              "    env: { NODE_ENV: 'production', PYTHONIOENCODING: 'utf-8' }"
+              "  }]"
+              "};"
+            )
+            ($eco -join "`n") | Set-Content -Encoding UTF8 ecosystem.config.js
           }
           pm2 restart ${{ env.SERVICE_NAME }} --update-env 2>$null
           if ($LASTEXITCODE -ne 0) {
