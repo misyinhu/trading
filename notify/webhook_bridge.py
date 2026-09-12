@@ -2506,6 +2506,15 @@ def _ctp_norm_profile(p) -> str:
     return p if p in _CTP_PROFILES else "simnow"
 
 
+def _ctp_python() -> str:
+    """跑 CTP worker 的解释器。
+
+    SWIG 绑定是 cp313 的 .pyd，而桥自身可能跑在 3.12；故允许用 CTP_PYTHON
+    指向 Python 3.13 解释器。未设置则沿用当前解释器。
+    """
+    return os.environ.get("CTP_PYTHON") or sys.executable
+
+
 def _ctp_snapshot(force: bool = False, timeout: float = 30.0, profile: str = "simnow"):
     """在独立子进程运行 CTP worker，返回账户+持仓快照 dict。
 
@@ -2522,10 +2531,11 @@ def _ctp_snapshot(force: bool = False, timeout: float = 30.0, profile: str = "si
             return bool(data.get("ok")), data
     worker = Path(PROJECT_ROOT) / "ctp_client" / "ctp_worker.py"
     try:
+        _ctp_env = {**os.environ, "CTP_PROFILE": profile}
         proc = subprocess.run(
-            [sys.executable, "-u", str(worker)],
+            [_ctp_python(), "-u", str(worker)],
             cwd=PROJECT_ROOT, capture_output=True, text=True,
-            timeout=timeout, env={**os.environ, "CTP_PROFILE": profile},
+            timeout=timeout, env=_ctp_env,
         )
     except subprocess.TimeoutExpired:
         return False, {"ok": False, "status": "timeout", "profile": profile,
@@ -2567,7 +2577,7 @@ def _ctp_run_action(action: str, order: dict, timeout: float = 40.0, profile: st
     env["CTP_PROFILE"] = profile
     try:
         proc = subprocess.run(
-            [sys.executable, "-u", str(worker)],
+            [_ctp_python(), "-u", str(worker)],
             cwd=PROJECT_ROOT, capture_output=True, text=True,
             timeout=timeout, env=env,
         )
