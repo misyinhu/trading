@@ -2535,6 +2535,7 @@ def _ctp_snapshot(force: bool = False, timeout: float = 30.0, profile: str = "si
         proc = subprocess.run(
             [_ctp_python(), "-u", str(worker)],
             cwd=PROJECT_ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=timeout, env=_ctp_env,
         )
     except subprocess.TimeoutExpired:
@@ -2579,6 +2580,7 @@ def _ctp_run_action(action: str, order: dict, timeout: float = 40.0, profile: st
         proc = subprocess.run(
             [_ctp_python(), "-u", str(worker)],
             cwd=PROJECT_ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=timeout, env=env,
         )
     except subprocess.TimeoutExpired:
