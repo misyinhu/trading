@@ -27,16 +27,13 @@ CTP 通道支持两个独立仿真账号，由 `profile` 参数选择（查询�
 | profile | 通道 | 配置来源 | 状态 |
 |---|---|---|---|
 | `simnow`（默认） | 官方 SimNow 第一套环境 `182.254.243.31` | `SIMNOW_SIM_*` | ✅ 已通（账号 274467）|
-| `citic` | 中信期货评测柜台 电信 `tcp://101.226.254.149:53205`、联通 `tcp://140.206.167.53:53205`；BrokerID `66666`；AppID `client_quagent_1.0` | `CITIC_CTP_*` | ⚠️ 配置就位，握手阻塞 |
+| `citic` | 中信期货评测柜台 电信 `tcp://101.226.254.149:53205`、联通 `tcp://140.206.167.53:53205`；BrokerID `66666`；AppID `client_quagent_1.0` | `CITIC_CTP_*` | ✅ 已通（账号 7108804861，2026-09-16 验证）|
 
 示例：`GET /api/ctp/account?profile=citic&force=1`；报单 body 加 `"profile":"citic"`。
 
-> **已知阻塞（中信）**：前置握手返回 `rsp error [4040] CTP:API Front shake hand err: decode err`，
-> 电信/联通两条线路一致。TCP 已连通、账号/密码/认证码/AppID/BrokerID/前置均已写入，判断为
-> **本机 CTP API 库（SWIG 6.7.11.1，为 SimNow 构建）与中信评测柜台协议版本不匹配**。
-> 需取中信「看穿式接入指引」中与该 AppID 配套的 **CTP API 版本 / 动态库（thosttraderapi_se.dll 等）**，
-> 用该版本重建 SWIG 后重试；与应用层代码无关。配置在 winclaw
-> `C:\projects\trading\.streamlit\secrets.toml` 的 `CITIC_CTP_*`。
+> **已解决（2026-09-16）**：从 winclaw `C:\tmp\ctp_api\` 拷入 `ctp_swig_build-6.5.1cp`
+>（含 WinDataCollect.dll），PM2 ecosystem 注入 `CTP_SWIG_PATH_CITIC` 后，中信登录成功。
+> SWIG 路径/解释器均已配置化（环境变量覆盖），切换机器时只需改路径无需改代码。
 
 ## 接口清单
 
@@ -363,3 +360,64 @@ curl -X POST http://100.99.204.126:5002/api/gm/order \
 - gm SDK 裸调 `get_cash/order_volume`（不走 `run()` 框架）会在原生层阻塞退出，
   务必使用 `gmsim_worker.py` 的 `run(mode=1)` 回调模式。
 - 部署见 `gm_client/README.md`（建 venv → `pip install gm` → 复制 worker → 配 secrets）。
+
+---
+
+## 数据源健康探测（quant-agent `data_health`）
+
+quant-agent 提供跨服务器聚合的四源探测端点，供数据层和研究员查询各数据通路状态。
+
+**端点**
+
+```
+GET http://127.0.0.1:5003/api/data/health
+```
+
+> 注：quant-agent spine proxy 跑在 `:5003`（`:5001` 被 coze-intake-webhook 占用），
+> 所有 `/api/*` 请求走 `:5003`。
+
+**探测范围（各源相互独立，坏一个不影响其他）**
+
+| 键 | 数据源 | 端点 | 说明 |
+|---|---|---|---|
+| `ib` | IB 外盘期货 | `quant-core :8005 /source=ib` | GC 1h K 线验证 IB 会话正常 |
+| `ctp_citic` | 中信期货仿真 | `trading :5002 /api/ctp/account?profile=citic` | 登录状态 + 权益 |
+| `ctp_simnow` | SimNow 仿真 | `trading :5002 /api/ctp/account?profile=simnow` | 登录状态 + 权益 |
+| `gm` | 内盘期货 | `trading :5002 /api/gm/history` | RB 1h K 线验证 gm SDK 在线 |
+| `okx` | OKX 加密货币 | `trading :5002 /api/okx-candles` | BTC-USDT-SWAP 行情 |
+
+**响应示例**
+
+```json
+{
+  "ok": true,
+  "active_server": "winclaw",
+  "sources": {
+    "ib":        {"ok": true,  "latency_ms": 891,  "note": "IB 会话正常，外盘期货数据可取"},
+    "ctp_citic": {"ok": true,  "latency_ms": 2730, "note": "citic 登录在线，账户 7108804861", "balance": 986376.63},
+    "ctp_simnow":{"ok": true,  "latency_ms": 3284, "note": "simnow 登录在线，账户 274467",    "balance": 60000.0},
+    "gm":        {"ok": true,  "latency_ms": 8538, "note": "内盘可取 18 根 K 线"},
+    "okx":       {"ok": false, "latency_ms": 1020, "note": "HTTP 500（winclaw → OKX 连接被重置）"}
+  }
+}
+```
+
+**服务端点配置（`config/services.yaml`，切换时只改这里）**
+
+```yaml
+quant_core:
+  url: http://100.99.204.126:8005   # 现役 winclaw
+trading:
+  url: http://100.99.204.126:5002    # 现役 winclaw
+```
+
+**架构说明**
+
+```
+quant-agent :5003 ← data_health.check_all() → winclaw :8005 (quant-core/IB)
+                                    → winclaw :5002 (trading/gm/CTP/OKX)
+                 cxclaw :8005 / :5002      # 备用，数据不变
+```
+
+CTP 路径/解释器均已配置化（`CTP_SWIG_PATH_SIMNOW/CITIC` + `CTP_PYTHON` 环境变量），
+切换机器时只需在 `config/services.yaml` 和 PM2 ecosystem 中改路径，代码无需改动。
