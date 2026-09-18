@@ -39,3 +39,21 @@ python ctp_md/run_worker.py --kind replay --replay tests/fixtures/fu2610_2026091
 ```
 
 仅仿真环境（simnow / 中信评测 66666），不接真实下单链路。
+
+## 实施状态（2026-09-18）
+
+- 离线回放验收：FU 09:07 案例 `O4799/H4800/L4798/C4798 V35` 一致；
+  断流演练 SSE 静默 3.0s 切快照兜底、分钟根恰好冻结一次（ts 幂等）。
+  单测 `tests/unit/test_ctp_md_worker.py`（6 项）。
+- winclaw：5003/5004 双进程常驻，订阅持久化在
+  `data/md_subscriptions_<profile>.json`；非交易时段前置不完成握手属正常，
+  logined/tick 推送需盘中观察（FU 夜盘 21:00、IC 日盘 09:30）。
+- quant-agent P2 客户端在 quant-agent 仓 `core/signals/ctp_md.py`，
+  两个 profile 分别连 5003/5004。
+
+## 原生层避坑记录
+
+- `CtpMdConnector` 必须在 `Init()` 前 `RegisterFront(md_server)`，否则永久卡 connecting。
+- 不要跨线程调 `api.Release()`（触发原生 Aborted，进程直接死）；重建只弃用旧实例。
+- 登录后断线由 CTP 原生自动重连；从未登录 120s 无进展才由 worker 重建。
+- 同进程只能加载一套 SWIG 绑定，故 simnow/citic 必须分进程分目录。
