@@ -31,7 +31,7 @@ jobs:
           $dst = "${{ env.DEPLOY_PATH }}"
           New-Item -ItemType Directory -Force -Path $dst | Out-Null
           # 运行时需要的源码目录（逐目录 /MIR；secrets/日志/缓存不在其中，不会被删）
-          $dirs = @("notify","client","config","ctp_client","gm_client","okx_client","account","orders")
+          $dirs = @("notify","client","config","ctp_client","ctp_md","gm_client","okx_client","account","orders")
           foreach ($d in $dirs) {
             if (Test-Path "$src\$d") {
               & robocopy "$src\$d" "$dst\$d" /MIR /NFL /NDL /NJH /NJS /NP /R:2 /W:3 `
@@ -92,6 +92,44 @@ jobs:
           cmd /c "pm2 restart ${{ env.SERVICE_NAME }} --update-env || (pm2 start ecosystem.config.js && pm2 save)"
           Start-Sleep -Seconds 8
           cmd /c "pm2 list"
+
+      - name: Start CTP md worker (Python 3.13, best-effort)
+        shell: powershell
+        run: |
+          # MdApi 走 SWIG 原生 .pyd（仅 cp313），必须独立进程：崩溃不带走 5002 桥接。
+          # 目标机没有 3.13 时跳过（非致命），bridge 部署不受影响。
+          $mdPy = $null
+          foreach ($cand in @(
+            "C:\Users\Apple\AppData\Local\Programs\Python\Python313\python.exe",
+            "C:\Users\wang\AppData\Local\Programs\Python\Python313\python.exe")) {
+            if (Test-Path $cand) { $mdPy = $cand; break }
+          }
+          if (-not $mdPy) {
+            Write-Host "Python 3.13 not found on runner host; skip ctp-md-worker"
+            exit 0
+          }
+          Set-Location "${{ env.DEPLOY_PATH }}"
+          $pyFwd = $mdPy -replace '\\','/'
+          $dstFwd = "${{ env.DEPLOY_PATH }}" -replace '\\','/'
+          $eco = @(
+            "module.exports = {"
+            "  apps: [{"
+            "    name: 'ctp-md-worker',"
+            "    script: '$pyFwd',"
+            "    args: 'ctp_md/run_worker.py --port 5003',"
+            "    cwd: '$dstFwd',"
+            "    env: { PYTHONIOENCODING: 'utf-8' }"
+            "  }]"
+            "};"
+          )
+          ($eco -join "`n") | Set-Content -Encoding UTF8 ecosystem.md.config.js
+          cmd /c "pm2 restart ctp-md-worker --update-env || (pm2 start ecosystem.md.config.js && pm2 save)"
+          Start-Sleep -Seconds 5
+          try {
+            (Invoke-WebRequest http://127.0.0.1:5003/health -UseBasicParsing -TimeoutSec 5).Content
+          } catch {
+            Write-Host "ctp-md-worker health not ready yet (non-fatal; check pm2 logs ctp-md-worker)"
+          }
 
       - name: Health check
         run: |
