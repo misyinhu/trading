@@ -113,6 +113,8 @@ class CtpMdConnector:
         self._api = CThostFtdcMdApi.CreateFtdcMdApi("")
         self._spi = _MdSpi(self, config)
         self._api.RegisterSpi(self._spi)
+        if getattr(config, "md_server", ""):
+            self._api.RegisterFront(config.md_server)
         self._api.Init()
         self._status = ConnectionStatus.CONNECTING
 
