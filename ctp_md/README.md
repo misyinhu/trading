@@ -9,6 +9,8 @@
 simnow 与中信评测的 SWIG 绑定版本不同（6.7.11.1 / 6.5.1_CP），同一进程只能
 加载一套，故分两个进程：**5003=simnow，5004=citic**。进程启动前用
 `CTP_PROFILE` 选定绑定目录（`ctp_client/ctp_connector.py` 模块级读取）。
+worker 与报单桥**同机部署**（Actions 部署在 trading 服务主机）；quant-agent
+侧的 host 默认从 trading 服务 URL 派生，桥迁机器时自动跟随，无需单独配 md host。
 
 ## 接口（示例为 5003，citic 换 5004）
 
