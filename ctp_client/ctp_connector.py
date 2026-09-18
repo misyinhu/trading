@@ -23,7 +23,50 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-_CTP_SWG_PATH = r"C:\tmp\ctp_api\ctp_swig_build-6.7.11.1\ctp_api"
+# 不同柜台协议版本不同（见 ctp_worker.py 头注）：simnow/live=6.7.11.1，
+# 中信评测(66666)=6.5.1_CP，混连握手必失败。进程启动前用 CTP_PROFILE 选定，
+# 也可用 CTP_SWIG_PATH_<PROFILE> / CTP_SWIG_PATH 覆盖。
+_SWIG_PATHS = {
+    "simnow": r"C:\tmp\ctp_api\ctp_swig_build-6.7.11.1\ctp_api",
+    "live": r"C:\tmp\ctp_api\ctp_swig_build-6.7.11.1\ctp_api",
+    "citic": r"C:\tmp\ctp_api\ctp_swig_build-6.5.1cp\ctp_api",
+}
+_CTP_SWG_PATH = os.environ.get(
+    "CTP_SWIG_PATH",
+    _SWIG_PATHS.get(os.environ.get("CTP_PROFILE", "simnow").strip().lower(),
+                    _SWIG_PATHS["simnow"]))
+
+# 模块级 Spi 基类：绑定可用就用真的；否则用空壳保证模块在无绑定机器
+# （如 Mac/CI）仍可被 import，实例化时再由 _require_ctp() 拦截。
+CThostFtdcMdApi = CThostFtdcMdSpi = None
+CThostFtdcTraderApi = CThostFtdcTraderSpi = None
+if os.path.exists(_CTP_SWG_PATH):
+    sys.path.insert(0, _CTP_SWG_PATH)
+    try:
+        os.add_dll_directory(_CTP_SWG_PATH)
+    except (AttributeError, OSError):
+        pass
+    os.environ["PATH"] = _CTP_SWG_PATH + os.pathsep + os.environ.get("PATH", "")
+    try:
+        from thostmduserapi import CThostFtdcMdApi as _MdApi, CThostFtdcMdSpi as _MdSpiBase
+        CThostFtdcMdApi, CThostFtdcMdSpi = _MdApi, _MdSpiBase
+    except Exception:
+        pass
+    try:
+        from thosttraderapi import CThostFtdcTraderApi as _TdApi, CThostFtdcTraderSpi as _TdSpiBase
+        CThostFtdcTraderApi, CThostFtdcTraderSpi = _TdApi, _TdSpiBase
+    except Exception:
+        pass
+
+
+class _NoSpi:
+    """无 SWIG 绑定时的模块级占位基类（真正实例化会被 _require_ctp 拦截）。"""
+
+
+if CThostFtdcMdSpi is None:
+    CThostFtdcMdSpi = _NoSpi
+if CThostFtdcTraderSpi is None:
+    CThostFtdcTraderSpi = _NoSpi
 
 
 def _check_ctp() -> bool:

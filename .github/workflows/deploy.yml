@@ -93,10 +93,11 @@ jobs:
           Start-Sleep -Seconds 8
           cmd /c "pm2 list"
 
-      - name: Start CTP md worker (Python 3.13, best-effort)
+      - name: Start CTP md workers (Python 3.13, best-effort)
         shell: powershell
         run: |
           # MdApi 走 SWIG 原生 .pyd（仅 cp313），必须独立进程：崩溃不带走 5002 桥接。
+          # simnow 与 citic 绑定版本不同（6.7.11.1 / 6.5.1_CP），分两进程 5003/5004。
           # 目标机没有 3.13 时跳过（非致命），bridge 部署不受影响。
           $mdPy = $null
           foreach ($cand in @(
@@ -105,7 +106,7 @@ jobs:
             if (Test-Path $cand) { $mdPy = $cand; break }
           }
           if (-not $mdPy) {
-            Write-Host "Python 3.13 not found on runner host; skip ctp-md-worker"
+            Write-Host "Python 3.13 not found on runner host; skip ctp md workers"
             exit 0
           }
           Set-Location "${{ env.DEPLOY_PATH }}"
@@ -113,22 +114,25 @@ jobs:
           $dstFwd = "${{ env.DEPLOY_PATH }}" -replace '\\','/'
           $eco = @(
             "module.exports = {"
-            "  apps: [{"
-            "    name: 'ctp-md-worker',"
-            "    script: '$pyFwd',"
-            "    args: 'ctp_md/run_worker.py --port 5003',"
-            "    cwd: '$dstFwd',"
-            "    env: { PYTHONIOENCODING: 'utf-8' }"
-            "  }]"
+            "  apps: ["
+            "    { name: 'ctp-md-simnow', script: '$pyFwd',"
+            "      args: 'ctp_md/run_worker.py --profiles simnow --port 5003',"
+            "      cwd: '$dstFwd', env: { CTP_PROFILE: 'simnow', PYTHONIOENCODING: 'utf-8' } },"
+            "    { name: 'ctp-md-citic', script: '$pyFwd',"
+            "      args: 'ctp_md/run_worker.py --profiles citic --port 5004',"
+            "      cwd: '$dstFwd', env: { CTP_PROFILE: 'citic', PYTHONIOENCODING: 'utf-8' } }"
+            "  ]"
             "};"
           )
           ($eco -join "`n") | Set-Content -Encoding UTF8 ecosystem.md.config.js
-          cmd /c "pm2 restart ctp-md-worker --update-env || (pm2 start ecosystem.md.config.js && pm2 save)"
+          cmd /c "pm2 startOrReload ecosystem.md.config.js --update-env && pm2 save"
           Start-Sleep -Seconds 5
-          try {
-            (Invoke-WebRequest http://127.0.0.1:5003/health -UseBasicParsing -TimeoutSec 5).Content
-          } catch {
-            Write-Host "ctp-md-worker health not ready yet (non-fatal; check pm2 logs ctp-md-worker)"
+          foreach ($p in 5003,5004) {
+            try {
+              (Invoke-WebRequest "http://127.0.0.1:$p/health" -UseBasicParsing -TimeoutSec 5).Content
+            } catch {
+              Write-Host "ctp md :$p health not ready yet (non-fatal; check pm2 logs)"
+            }
           }
 
       - name: Health check

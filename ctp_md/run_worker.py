@@ -25,36 +25,46 @@ from ctp_md.server import create_blueprint, health_components  # noqa: E402
 
 
 def build_ctp_profiles(names: list[str]) -> dict:
-    """从 ctp_client.ctp_worker 的 profile 装配器构造 worker 配置。"""
+    """从 ctp_client.ctp_worker 的 profile 装配器构造 worker 配置。
+
+    simnow 与 citic 的 SWIG 绑定版本不同（6.7.11.1 vs 6.5.1_CP），同一进程
+    只能加载一套，故一个 worker 进程只允许一个 ctp profile；多 profile 各起
+    一个进程（5003=simnow，5004=citic）。CTP_PROFILE 必须在 import ctp_client
+    之前设置，ctp_connector 模块级按它选绑定目录。
+    """
+    if len(names) != 1:
+        raise SystemExit(
+            f"ctp_client 模式每进程仅支持 1 个 profile，收到 {names}；"
+            "请分别起 5003/5004 两个进程")
+    import os
+    os.environ["CTP_PROFILE"] = names[0]
     from ctp_client.ctp_worker import _load_config
 
     out: dict = {}
-    for name in names:
-        c = _load_config(name)
-        missing = c.get("_missing") or []
-        if not c.get("md_server") or missing:
-            print(f"[md-worker] profile={name} 跳过：缺配置 {missing or ['md_server']}",
-                  file=sys.stderr, flush=True)
-            continue
-        out[name] = {
-            "kind": "ctp_client",
-            "md_front": c["md_server"],
-            "broker_id": c["broker_id"],
-            "user": c["user"],
-            "password": c["password"],
-            "auth_code": c.get("auth_code", ""),
-            "app_id": c.get("app_id", ""),
-        }
+    name = names[0]
+    c = _load_config(name)
+    missing = c.get("_missing") or []
+    if not c.get("md_server") or missing:
+        raise SystemExit(f"[md-worker] profile={name} 缺配置：{missing or ['md_server']}")
+    out[name] = {
+        "kind": "ctp_client",
+        "md_front": c["md_server"],
+        "broker_id": c["broker_id"],
+        "user": c["user"],
+        "password": c["password"],
+        "auth_code": c.get("auth_code", ""),
+        "app_id": c.get("app_id", ""),
+    }
     return out
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--profiles", default="simnow,citic",
-                    help="逗号分隔；与 ctp_client profile 同名")
+    ap.add_argument("--profiles", default="simnow",
+                    help="ctp_client 模式仅支持单个（simnow / citic）")
     ap.add_argument("--port", type=int, default=5003)
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--state", default=str(ROOT / "data" / "md_subscriptions.json"))
+    ap.add_argument("--state", default="")
     ap.add_argument("--kind", default="ctp_client", choices=["ctp_client", "replay"])
     ap.add_argument("--replay", default="")
     args = ap.parse_args()
@@ -71,7 +81,8 @@ def main() -> int:
         print("[md-worker] 没有可用 profile，退出", file=sys.stderr)
         return 1
 
-    state_path = args.state
+    state_tag = (list(profiles)[0] if args.kind == "ctp_client" else "replay")
+    state_path = args.state or str(ROOT / "data" / f"md_subscriptions_{state_tag}.json")
     Path(state_path).parent.mkdir(parents=True, exist_ok=True)
     store = TickStore()
     manager = MdWorkerManager(profiles, store, state_path)

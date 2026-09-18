@@ -4,7 +4,13 @@
 **必须与 5002 webhook 桥接分进程**：CTP SWIG `.pyd`（仅 cp313）可能进程级崩溃，
 独立进程不影响桥接主服务。
 
-## 接口（端口 5003）
+## 进程拓扑（每 profile 独立进程）
+
+simnow 与中信评测的 SWIG 绑定版本不同（6.7.11.1 / 6.5.1_CP），同一进程只能
+加载一套，故分两个进程：**5003=simnow，5004=citic**。进程启动前用
+`CTP_PROFILE` 选定绑定目录（`ctp_client/ctp_connector.py` 模块级读取）。
+
+## 接口（示例为 5003，citic 换 5004）
 
 - `POST /api/ctp/md/subscribe` `{profile, instruments[]}` 订阅（持久化到 `data/md_subscriptions.json`，重启自动补订阅）
 - `POST /api/ctp/md/unsubscribe`
@@ -21,10 +27,11 @@ profile 与 `ctp_client` 同名（simnow / citic），凭证完全复用
 ## 运行（Python 3.13）
 
 ```bat
-C:\Users\wang\AppData\Local\Programs\Python\Python313\python.exe ctp_md\run_worker.py --port 5003
+C:\Users\wang\AppData\Local\Programs\Python\Python313\python.exe ctp_md\run_worker.py --profiles simnow --port 5003
+C:\Users\wang\AppData\Local\Programs\Python\Python313\python.exe ctp_md\run_worker.py --profiles citic  --port 5004
 ```
 
-部署由 `.github/workflows/deploy.yml` 在桥接部署后以 pm2 进程 `ctp-md-worker` 拉起（best-effort）。
+部署由 `.github/workflows/deploy.yml` 在桥接部署后以 pm2 进程 `ctp-md-simnow`(:5003) / `ctp-md-citic`(:5004) 拉起（best-effort）。
 离线回放（无 SWIG 环境联调）：
 
 ```
