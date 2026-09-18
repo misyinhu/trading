@@ -161,13 +161,8 @@ class LegacyCtpConnector(BaseConnector):
     def stop(self) -> None:
         if getattr(self, "_stop_poll", None) is not None:
             self._stop_poll.set()
-        try:
-            api = getattr(self._conn, "_api", None)
-            if api is not None:
-                api.Release()
-        except Exception:
-            pass
-        self._conn = None
+        # 故意不调 api.Release()：跨线程 Release 是该 SWIG 绑定已知的原生 abort
+        # 来源；旧实例直接弃用，进程退出由 OS 回收。
         self._status("disconnected", "stopped")
 
     def subscribe(self, instruments: list[str]) -> None:
@@ -199,13 +194,18 @@ class LegacyCtpConnector(BaseConnector):
                 elif st == ConnectionStatus.ERROR:
                     self._status("error", getattr(self._conn, "last_error", "") or "md error")
                 elif st == ConnectionStatus.DISCONNECTED and self._ever_logined:
-                    self._status("disconnected", "front disconnected")
+                    # CTP 原生层自动重连前置并重新 OnFrontConnected→登录，
+                    # 不交给 worker 重建（同进程反复 CreateMdApi 易原生 abort）。
+                    self._status("logining", "front disconnected, native reconnecting")
+                    self._connect_since = time.monotonic()
                 elif st in (ConnectionStatus.CONNECTING, ConnectionStatus.CONNECTED):
                     if not self._ever_logined:
                         self._status("logining", st.value)
-                        # 旧连接器自身不重连：连接/登录 30s 无进展 -> error，交 worker 指数退避重建
-                        if time.monotonic() - self._connect_since > 30:
-                            self._status("error", f"no login within 30s ({st.value})")
+                        # 连接/登录 120s 无进展 -> error，交 worker 重建（非交易时段前置
+                        # 可能接受 TCP 但不回登录，不能用 30s 短窗频繁重建致原生 abort）
+                        if time.monotonic() - self._connect_since > 120:
+                            self._status("error", f"no login within 120s ({st.value})")
+                            self._connect_since = time.monotonic()
             except Exception:
                 pass
             self._stop_poll.wait(0.5)

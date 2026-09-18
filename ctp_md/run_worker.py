@@ -48,7 +48,7 @@ def build_ctp_profiles(names: list[str]) -> dict:
         raise SystemExit(f"[md-worker] profile={name} 缺配置：{missing or ['md_server']}")
     out[name] = {
         "kind": "ctp_client",
-        "md_front": c["md_server"],
+        "md_front": os.environ.get(f"CTP_MD_FRONT_{name.upper()}", c["md_server"]),
         "broker_id": c["broker_id"],
         "user": c["user"],
         "password": c["password"],
