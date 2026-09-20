@@ -17,7 +17,7 @@ from typing import Optional, Callable, Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from ib_insync import IB
-from config import load_config, get_ibkr_host, get_ibkr_port
+from config import load_config, get_ibkr_host, get_ibkr_port, get_ibkr_client_id
 
 load_config()
 logger = logging.getLogger(__name__)
@@ -34,7 +34,8 @@ class IBConnectionManager:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._host = get_ibkr_host()
         self._port = get_ibkr_port()
-        self._client_id: int = 999  # 避免与 IB Gateway 自己使用的 clientId=0 冲突
+        # 固定下单 clientId（默认 2），不在 2-99 间扫描漂移
+        self._client_id: int = get_ibkr_client_id()
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
         self._error: Optional[Exception] = None
@@ -48,8 +49,23 @@ class IBConnectionManager:
                 if cls._instance is None:
                     cls._instance = cls()
         return cls._instance
+
+    def _reclaim_client_id(self) -> None:
+        """对固定 clientId 做一次抢占式清理。
+
+        进程崩溃/被 kill 后，Gateway 可能短暂保留同 clientId 的僵尸会话，
+        立刻重连会报 326「客户号码已被使用」。新建一个 IB 用同一 id 连一下再断，
+        逼退残留会话；失败不阻断主连接（_run_loop 会再试并由重连逻辑兜底）。
+        """
+        probe = IB()
+        try:
+            probe.connect(self._host, self._port, clientId=self._client_id, timeout=3)
+            probe.disconnect()
+            logger.info(f"[IB] reclaimed fixed clientId={self._client_id}")
+        except Exception as e:  # noqa: BLE001
+            logger.info(f"[IB] reclaim clientId={self._client_id} skipped: {e}")
     
-    def start(self, timeout: float = 15.0) -> IB:
+    def start(self, timeout: float = 5.0) -> IB:
         """启动 IB 连接（在后台线程中）"""
         if self._thread is not None and self._thread.is_alive():
             if self._ib and self._ib.isConnected():
@@ -58,6 +74,8 @@ class IBConnectionManager:
                 if self._ib and self._ib.isConnected():
                     return self._ib
         
+        # 新建连接前先逼退可能残留的同 clientId 僵尸会话
+        self._reclaim_client_id()
         self._ready.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="IB-Worker")
         self._thread.start()

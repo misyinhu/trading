@@ -40,6 +40,10 @@ class ExchangeMapper:
         
         # 金属 (NYMEX)
         'PL': 'NYMEX', 'PA': 'NYMEX',
+        # 能源 (NYMEX)
+        'HO': 'NYMEX',
+        # 港股期货 (HKFE)
+        'HSI': 'HKFE', 'HSTECH': 'HKFE', 'MHI': 'HKFE',
     }
     
     def __init__(self):

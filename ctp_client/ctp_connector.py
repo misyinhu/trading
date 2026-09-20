@@ -52,11 +52,15 @@ if os.path.exists(_CTP_SWG_PATH):
         CThostFtdcMdApi, CThostFtdcMdSpi = _MdApi, _MdSpiBase
     except Exception:
         pass
-    try:
-        from thosttraderapi import CThostFtdcTraderApi as _TdApi, CThostFtdcTraderSpi as _TdSpiBase
-        CThostFtdcTraderApi, CThostFtdcTraderSpi = _TdApi, _TdSpiBase
-    except Exception:
-        pass
+    # md-only 进程（独立行情 worker，CTP_MD_ONLY=1）禁止加载 trader 原生库：
+    # trader+md 两套 se 库同进程共存，开盘后 md 回调线程会原生 abort
+    # （2026-09-18 simnow md worker 实测 <no Python frame> 崩溃）。
+    if os.environ.get("CTP_MD_ONLY") != "1":
+        try:
+            from thosttraderapi import CThostFtdcTraderApi as _TdApi, CThostFtdcTraderSpi as _TdSpiBase
+            CThostFtdcTraderApi, CThostFtdcTraderSpi = _TdApi, _TdSpiBase
+        except Exception:
+            pass
 
 
 class _NoSpi:
@@ -70,14 +74,20 @@ if CThostFtdcTraderSpi is None:
 
 
 def _check_ctp() -> bool:
-    """运行时验证 CTP SWIG .pyd 是否可用（需 cp313 Python）。"""
+    """运行时验证 CTP SWIG .pyd 是否可导入（需 cp313 Python）。
+
+    不能在这里创建临时 API 再 Release：CTP 同一进程内只能稳定持有一个
+    MdApi/TraderApi 实例，探测实例释放后再创建真实实例会导致回调丢失或
+    原生层直接终止进程。
+    """
     if not os.path.exists(_CTP_SWG_PATH):
         return False
     try:
         sys.path.insert(0, _CTP_SWG_PATH)
-        from thosttraderapi import CThostFtdcTraderApi
-        api = CThostFtdcTraderApi.CreateFtdcTraderApi("")
-        api.Release()
+        if os.environ.get("CTP_MD_ONLY") == "1":
+            import thostmduserapi  # noqa: F401
+            return True
+        import thosttraderapi  # noqa: F401
         return True
     except Exception:
         return False

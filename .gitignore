@@ -20,3 +20,9 @@ AGENTS.md
 **/.streamlit/secrets.toml
 **/secrets.toml
 settings_cxclaw.yaml
+
+# 本地备份/缓存/测试产物
+*.bak-*
+.order_dedup_cache.json
+coverage-report.json
+.omo/

@@ -1,5 +1,5 @@
 const http = require('http');
-const options = {hostname: '127.0.0.1', port: 9222, path: '/json/list', method: 'GET'};
+const options = {hostname: '127.0.0.1', port: 9224, path: '/json/list', method: 'GET'};
 const req = http.request(options, (res) => {
     let data = '';
     res.on('data', (chunk) => data += chunk);

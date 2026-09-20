@@ -27,6 +27,11 @@ CMDTY_SYMBOLS = {
 }
 
 TRADING_PATTERNS = [
+    # ===== 定时平仓 SCHEDULED_CLOSE =====（时间修饰语优先，阻止被 "平仓" 误匹配）
+    (r"^(\d{1,2})点(\d{1,2})平仓(\S+)?$", "SCHEDULED_CLOSE"),  # 9点30平仓GC
+    (r"^(\d{1,2})点平仓(\S+)?$", "SCHEDULED_CLOSE"),          # 9点平仓GC
+    (r"^(\d{1,2}):(\d{2})平仓(\S+)?$", "SCHEDULED_CLOSE"),   # 09:30平仓GC
+    (r"^(\d+)分钟(?:后)?平仓(\S+)?$", "SCHEDULED_CLOSE"),      # 30分钟后平仓GC
     # ===== 平仓 CLOSE ===== (具体 pattern 在前，通用在后)
     (r"平掉(\S+?)(?:仓|位)$", "CLOSE"),
     (r"平仓(\d+)(?:手|股)(\S+)$", "CLOSE"),  # 平仓2手GC
@@ -78,12 +83,51 @@ QUERY_PATTERNS = [
 
 
 def parse_trading_command(message: str) -> Dict[str, Any]:
+    import datetime as _dt
+
     msg = message.strip()
     msg_lower = msg.lower()
 
     for pattern in QUERY_PATTERNS:
         if re.search(pattern, msg_lower):
             return {"action": "QUERY", "raw": msg}
+
+    # ---- 定时平仓 SCHEDULED_CLOSE ----
+    _SCHEDULED_PATTERNS = [
+        (r"^(\d{1,2})点(\d{1,2})平仓(\S+)?$", "HM"),   # 9点30平仓GC
+        (r"^(\d{1,2})点平仓(\S+)?$", "H"),            # 9点平仓GC
+        (r"^(\d{1,2}):(\d{2})平仓(\S+)?$", "HM"),     # 09:30平仓GC
+        (r"^(\d+)分钟(?:后)?平仓(\S+)?$", "DELTA"),    # 30分钟后平仓GC
+    ]
+    for _spat, _stype in _SCHEDULED_PATTERNS:
+        _sm = re.match(_spat, msg_lower)
+        if _sm:
+            _sgroups = _sm.groups()
+            _result = {"action": "SCHEDULED_CLOSE", "raw": msg}
+            _now = _dt.datetime.now().replace(second=0, microsecond=0)
+            _sym = None
+            if _stype == "HM":
+                _hour, _minute = int(_sgroups[0]), int(_sgroups[1])
+                _sym = _sgroups[2]
+                _result["schedule_time"] = _now.replace(hour=_hour, minute=_minute).isoformat()
+            elif _stype == "H":
+                _hour = int(_sgroups[0])
+                _sym = _sgroups[1]
+                _result["schedule_time"] = _now.replace(hour=_hour, minute=0).isoformat()
+            elif _stype == "DELTA":
+                _mins = int(_sgroups[0])
+                _sym = _sgroups[1]
+                _result["schedule_time"] = (_now + _dt.timedelta(minutes=_mins)).isoformat()
+            # 清理 symbol
+            if _sym:
+                _sym = _sym.upper().strip()
+                _sym = re.sub(r"(单元|手|股|仓|位)$", "", _sym).strip()
+                # 过滤无意义单字
+                _MEANINGLESS = {"仓", "位", "手", "股", "多", "空", "平", "买", "卖", "平"}
+                if _sym and _sym not in _MEANINGLESS and len(_sym) > 1:
+                    _result["symbol"] = _sym
+            return _result
+    # ---------------------------------
 
     for pattern, action in TRADING_PATTERNS:
         match = re.search(pattern, msg_lower)

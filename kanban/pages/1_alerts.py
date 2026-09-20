@@ -2,10 +2,11 @@
 
 import streamlit as st
 from src.tv import get_all_tv_indicators, TV_HOST, TV_PORT
+from src.config import get_zscore_alert_threshold, get_zscore_warn, get_zscore_critical
 
 # 可选周期
-TIMEFRAMES = ["1m", "5m", "15s", "30m", "3h"]
-DEFAULT_TF = "15s"
+TIMEFRAMES = ["1m", "5m", "15m", "30m", "3h"]
+DEFAULT_TF = "15m"
 
 
 def render_alert_center():
@@ -55,10 +56,10 @@ def render_alert_center():
                     zscore = float(
                         values["Z-Score"].replace("−", "-").replace("−", "-")
                     )
-                    if abs(zscore) >= 2:
+                    if abs(zscore) >= get_zscore_alert_threshold():
                         all_alerts.append(
                             {
-                                "level": "🔴" if abs(zscore) >= 3 else "🟡",
+                                "level": "🔴" if abs(zscore) >= get_zscore_critical() else ("🟡" if abs(zscore) >= get_zscore_warn() else "🟢"),
                                 "tab": f"Tab {tab_idx} ({symbol})",
                                 "indicator": study_name,
                                 "metric": "Z-Score",

@@ -7,25 +7,30 @@
 
 - 本文档覆盖 winclaw（`ssh winclaw` → `wang@100.99.204.126`，**一台 Windows**）上的**交易系统**：
   - quant 数据服务 **8005**（FastAPI/uvicorn）
-  - trading webhook 桥接 **5002**（Flask，TradingView/飞书/OKX webhook → 下单）
+  - trading webhook 桥接 **5002**（Flask，**纯仿真**：simnow/citic/gm/OKX/IB paper；2026-09-19 起拒绝 profile=live）
+  - **实盘网关 5006**（live_gateway，IB live 4001 + CTP live 直连 worker；实盘唯一入口，详见 `system-architecture.md`）
   - trading 看板 **8507**（Streamlit kanban）
-  - 外部依赖：IB Gateway **4002**、通达信 TdxW、TradingView CDP。
+  - 外部依赖：IB Gateway **4001(live)/4002(paper)**、通达信 TdxW、TradingView CDP。
 - **不在本文范围**：life-compass 产品三服务 compass **8505** / pmo-ask **5001** / personal-website **8504**。
   那是另一套（出 compass.qiaoge.top / ask.qiaoge.top 公网域名），见 life-compass 自己的 runbook，
   由计划任务 `MedalWatchdog` 保活。**MedalWatchdog 不保活本文任何服务**。
 - **端口红线**：8505/5001/8504 已被 life-compass 占用，trading 任何脚本/看板**不得**绑这三个口。
 - 订正 AGENTS.md：quant **与 trading 同机**（都在 winclaw 100.99.204.126），不是「另一台服务器」。
 
-## 1. 服务与端口总览（2026-09-02 实测）
+## 1. 服务与端口总览
+
+> 权威拓扑（含 5006 实盘网关、5003/5004 行情、跨机关系）见 [`system-architecture.md`](system-architecture.md)。
+> 下表为 2026-09-19 订正。
 
 | 服务 | 端口 | 技术/入口 | winclaw 目录 | 健康检查（本机） | 自启/保活 |
 |---|---|---|---|---|---|
 | quant 数据服务 | **8005** | Python313 `uvicorn quant_core.server.app:app --host 0.0.0.0 --port 8005` | `C:\projects\quant` | `GET /docs` 或 `/sources` 返回 200（**无** `/health` 路由，404 是正常） | ONLOGON `StartQuantServer`（登录拉起）+ **周期保活 `TradingHealthCheck`(15min)**：端口不通→触发 `StartQuantServer` |
-| trading webhook 桥接 | **5002** | Python313 `notify\webhook_bridge.py`（Flask） | `C:\projects\trading` | `GET /health` 200，body 含 feishu/order 组件状态 | ONLOGON/Time `wb_bridge2`（拉起）+ **周期保活 `TradingHealthCheck`(15min)**：端口不通→跑 `health_check.bat`（Python313，窗口标题精确杀重启） |
-| CTP 行情 simnow | **5003** | Python313 `ctp_md\run_worker.py --profiles simnow`（常驻 MdApi+SSE/快照，独立进程隔离 SWIG 崩溃） | `C:\projects\trading` | `GET /api/ctp/md/health`，盘中 state=logined/tick_count 增长 | `start_ctp_md_loop.bat` 双窗口崩溃 10s 自重入；Actions 部署走 pm2 `ctp-md-simnow` |
+| trading webhook 桥接 | **5002** | Python313 `notify\webhook_bridge.py`（Flask，**仅 simnow/citic 仿真**，live 返回 bad_profile） | `C:\projects\trading` | `GET /health` 200，body 含 feishu/order 组件状态 | **PM2 进程 `trading-bridge`（事实托管，`npx pm2 restart trading-bridge`）**；`wb_bridge2`/`TradingHealthCheck`(15min)/`health_check.bat` 兜底。勿手工另起，避免同端口多实例 |
+| **实盘网关 live-gateway** | **5006** | Python313 `live_gateway\live_gateway_app.py`（Flask）：IB live 直连 4001；CTP live 子进程直连 `ctp_worker.py`（强制 CTP_PROFILE=live，不代理 5002） | `C:\projects\trading` | `GET /health` 200（managed 含 U8590961）；`GET /api/ib/live/orders`、`/api/ctp/account` | **无自启/无看门狗**（实盘入口刻意人工掌控）；重启跑 `live_gateway\start_live_gateway.ps1`（先停旧 PID）；写操作须 `X-Real-Money: CONFIRM` |
+| CTP 行情 simnow | **5003** | Python313 `ctp_md\run_worker.py --profiles simnow`（常驻 MdApi+SSE/快照，独立进程隔离 SWIG 崩溃） | `C:\projects\trading` | `GET /api/ctp/md/health`，盘中 state=logined/tick_count 增长 | **2026-09-19 状态：pm2 stop**（6.7.11.1 md 绑定夜盘原生 abort，累计重启 3416 次；FU 卡回退 gm fail-safe）。cxclaw 同口部署，待绑定修复 |
 | CTP 行情 citic | **5004** | Python313 `ctp_md\run_worker.py --profiles citic`（绑定 6.5.1_CP，与 simnow 必须分进程） | `C:\projects\trading` | `GET /api/ctp/md/health` | 同上（pm2 `ctp-md-citic`）；非交易时段 logining 属正常 |
 | trading kanban 看板 | **8507** | Python313 `streamlit run kanban\app.py --server.port 8507` | `C:\projects\trading\kanban` | `GET /_stcore/health` → `ok` | **无**（手动起，未挂自启/保活，见待办） |
-| IB Gateway | **4002** | `C:\ibgateway\ibgateway.exe`（clientId=999） | `C:\ibgateway` | 进程在监听即可；quant 日志看 IB 连接 | 计划任务 `IBGW`(ONLOGON) |
+| IB Gateway | **4001 live / 4002 paper** | `C:\ibgateway\ibgateway.exe`（5006 连 4001 做实盘，仿真桥/研究连 4002） | `C:\ibgateway` | 进程在监听即可；quant 日志看 IB 连接 | 计划任务 `IBGW`(ONLOGON) |
 | 通达信 TdxW | — | `C:\new_tdx64\TdxW.exe`（行情源） | `C:\new_tdx64` | 进程在 | 计划任务 `StartTdxW`(Time) |
 | TradingView CDP | **9224** | `C:\Users\wang\Desktop\TV-Extracted\TradingView.exe --remote-debugging-port=9224`（便携版） | — | `http://127.0.0.1:9224/json/list` 可连；kanban `tv_cdp.port=9224` | 计划任务 `TradingView_CDP`/`_Launch`（2026-09 已对齐 TV-Extracted:9224）；桌面另有手动快捷方式 |
 
@@ -48,7 +53,7 @@ trading webhook 接收外部 POST 走 `http://100.99.204.126:5002/...`（TV/飞�
 
 ```bash
 # --- 健康检查（本机视角，最可靠）---
-ssh winclaw "powershell -NoProfile -Command \"foreach($p in 8005,5002,8507,4002){ Get-NetTCPConnection -LocalPort $p -State Listen -EA SilentlyContinue | Select-Object -First 1 | ForEach-Object { '$p PID='+$_.OwningProcess } }\""
+ssh winclaw "powershell -NoProfile -Command \"foreach($p in 8005,5002,5006,8507,4001,4002){ Get-NetTCPConnection -LocalPort $p -State Listen -EA SilentlyContinue | Select-Object -First 1 | ForEach-Object { '$p PID='+$_.OwningProcess } }\""
 
 # 5002 桥接健康（含 feishu/order 组件）
 ssh winclaw "powershell -NoProfile -Command \"(Invoke-WebRequest http://127.0.0.1:5002/health -UseBasicParsing -TimeoutSec 8).Content\""

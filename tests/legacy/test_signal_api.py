@@ -81,3 +81,71 @@ def test_submit_invalid_json(client):
     resp = client.post("/api/signals", data="not json",
                        content_type="application/json")
     assert resp.status_code == 400
+
+
+# ─── Approved strategy rejection tests ────────────────────────────────────────
+
+def test_submit_unapproved_strategy_returns_400(client, monkeypatch):
+    """未批准的 strategy_id 返回 HTTP 400"""
+    # Set approved cache to only contain "approved-strategy"
+    from orders.strategy_registry import get_approved_cache
+    cache = get_approved_cache()
+    cache.set_approved({"approved-strategy"})
+
+    resp = client.post("/api/signals", json={
+        "source": "quant-agent",
+        "strategy_id": "unapproved-strategy-id",
+        "strategy": "pairs-spread",
+        "symbol": "GC",
+        "direction": "long",
+        "quantity": 1,
+        "zscore": 2.1,
+        "reason": "test",
+    })
+    assert resp.status_code == 400
+    data = json.loads(resp.data)
+    assert data["status"] == "rejected"
+    assert "not approved" in data.get("reason", "").lower()
+
+
+def test_submit_approved_strategy_passes(client, monkeypatch):
+    """已批准的 strategy_id 通过校验"""
+    from orders.strategy_registry import get_approved_cache
+    cache = get_approved_cache()
+    cache.set_approved({"strat-pl-pa-001"})
+
+    resp = client.post("/api/signals", json={
+        "source": "quant-agent",
+        "strategy_id": "strat-pl-pa-001",
+        "strategy": "pl-pa-ratio",
+        "symbol": "PL",
+        "direction": "short",
+        "quantity": 1,
+        "zscore": 2.1,
+        "reason": "test approved",
+    })
+    # Should be reviewed (risk gate still runs)
+    assert resp.status_code in (200, 201)
+    data = json.loads(resp.data)
+    assert data["status"] in ("reviewed", "rejected")  # risk gate may still reject
+
+
+def test_submit_no_strategy_id_passes(client):
+    """不提供 strategy_id 的信号（向后兼容）仍然通过"""
+    from orders.strategy_registry import get_approved_cache
+    cache = get_approved_cache()
+    cache.set_approved(set())  # clear cache
+
+    resp = client.post("/api/signals", json={
+        "source": "pairs-scanner",
+        "symbol": "GC",
+        "direction": "long",
+        "quantity": 1,
+        "zscore": 2.1,
+        "strategy": "gc-si-ratio",
+        "reason": "no strategy_id provided",
+    })
+    # No strategy_id → skip approval check → normal flow
+    assert resp.status_code in (200, 201)
+    data = json.loads(resp.data)
+    assert data.get("status") in ("reviewed", "rejected", "executed")

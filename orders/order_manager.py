@@ -60,6 +60,10 @@ class OrderManager:
                 conId=ctx.conId or None,
                 close_position=ctx.close_position,
                 outside_rth=ctx.outside_rth,
+                order_type=getattr(ctx, "order_type", "MKT") or "MKT",
+                limit_price=getattr(ctx, "limit_price", None),
+                stop_price=getattr(ctx, "stop_price", None),
+                tif=getattr(ctx, "tif", "DAY") or "DAY",
             )
         elif ctx.exchange == "OKX":
             result = {"status": "Submitted", "orderId": "okx_pending"}

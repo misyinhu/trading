@@ -7,19 +7,20 @@ IBKR 交易历史获取工具
 import sys
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 确保使用正确的 Python 环境（虚拟环境支持）
 try:
-    from config.env_config import ensure_venv, get_ib_port
+    from config.env_config import ensure_venv
+
     ensure_venv()
 except ImportError:
     pass
 
 try:
-    from ib_insync import IB, Trade, Contract, Order
+    from ib_insync import IB
 except ImportError:
     print("错误: 需要安装 ib_insync")
     print("运行: pip install ib_insync")
@@ -35,10 +36,11 @@ def get_trades_year():
 
     try:
         from config.env_config import get_ib_port
+
         ib_port = get_ib_port()
     except Exception:
         ib_port = 4001
-    
+
     try:
         ib.connect("127.0.0.1", ib_port, clientId=get_client_id())
 
@@ -137,7 +139,7 @@ def analyze_trades(trades):
     print(f"卖出次数: {actions['SELL']}")
     print(f"总佣金: ${total_commission:.2f}")
 
-    print(f"\n按品种统计:")
+    print("\n按品种统计:")
     print(f"{'品种':<10} {'买入':<10} {'卖出':<10} {'交易数':<10}")
     print(f"{'-' * 40}")
     for sym, stats in sorted(symbols.items()):
@@ -170,11 +172,12 @@ def main():
     ib = IB()
     try:
         from config.env_config import get_ib_port
+
         ib_port = get_ib_port()
     except Exception:
         ib_port = 4001
     ib_host = "127.0.0.1"
-    
+
     try:
         ib.connect(ib_host, ib_port, clientId=get_client_id())
         print("✅ IB Gateway 已连接")

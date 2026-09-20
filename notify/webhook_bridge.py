@@ -31,6 +31,7 @@ except Exception:
     pass
 
 import json
+import hashlib
 import subprocess
 import time
 import logging
@@ -74,6 +75,10 @@ def _submit_order_in_background(
     close_position=False,
     outside_rth=None,
     signal_id: str = "",
+    order_type: str = "MKT",
+    limit_price=None,
+    stop_price=None,
+    tif: str = "DAY",
 ):
     """在后台提交订单，避免阻塞主线程。
 
@@ -100,6 +105,10 @@ def _submit_order_in_background(
                 close_position=close_position,
                 outside_rth=outside_rth,
                 signal_id=signal_id,
+                order_type=str(order_type or "MKT").upper(),
+                limit_price=limit_price,
+                stop_price=stop_price,
+                tif=tif or "DAY",
             )
             result = mgr.place(ctx, gate_mode=GateMode.ADVISORY)
             # 成交后回写需要 orderId → signal_id 映射
@@ -114,6 +123,8 @@ def _submit_order_in_background(
                 "filled": result.filled,
                 "message": result.message,
                 "risk_warnings": result.risk_warnings,
+                "order_type": getattr(ctx, "order_type", "MKT"),
+                "limit_price": getattr(ctx, "limit_price", None),
             }
         except Exception as e:
             print(f"[FEISHU] Background order error: {e}", file=sys.stderr)
@@ -2498,12 +2509,85 @@ def _get_okx_trader():
 _ctp_snapshot_cache: dict = {}   # profile -> {"ts": float, "data": dict}
 _CTP_SNAPSHOT_TTL = 20.0  # 秒：账户/持仓快照缓存，避免每次请求都 spawn 原生子进程
 _ctp_snap_lock = threading.Lock()
+# 5002 是纯仿真桥：实盘 profile=live 一律拒绝（实盘唯一入口是 winclaw:5006 live-gateway，
+# 由其直连 ctp_worker 子进程并强制 CTP_PROFILE=live）。
 _CTP_PROFILES = ("simnow", "citic")
 
 
-def _ctp_norm_profile(p) -> str:
-    p = (p or "simnow").strip().lower()
-    return p if p in _CTP_PROFILES else "simnow"
+# 主力合约日内稳定：默认缓存到当前主力板文件，重启后也不重复登录 CTP。
+_ctp_main_board_cache: dict = {}
+_ctp_main_board_lock = threading.Lock()
+_CTP_MAIN_BOARD_TTL = float(os.environ.get("CTP_MAIN_BOARD_TTL", "21600"))
+
+
+def _ctp_main_board_cache_path(profile: str, key: str) -> Path:
+    cache_dir = Path(PROJECT_ROOT) / "data" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"ctp_main_board_{profile}_{key}.json"
+
+
+def _ctp_main_board_cached(profile: str, products: list[dict], force: bool = False):
+    """返回 (payload, source)。source=memory|disk|live|stale。"""
+    canonical = ",".join(f"{str(x.get('product', '')).upper()}:{str(x.get('exchange', '')).upper()}"
+                         for x in products)
+    key = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12] if canonical else "default"
+    cache_file = _ctp_main_board_cache_path(profile, key)
+    now = time.time()
+
+    def _usable(payload):
+        return bool(payload) and payload.get("ok") and payload.get("contracts")             and now - float(payload.get("fetched_at", 0)) < _CTP_MAIN_BOARD_TTL
+
+    if not force:
+        with _ctp_main_board_lock:
+            mem = _ctp_main_board_cache.get((profile, key))
+            if _usable(mem):
+                return mem, "memory"
+        if cache_file.exists():
+            try:
+                disk = json.loads(cache_file.read_text(encoding="utf-8"))
+                if _usable(disk):
+                    with _ctp_main_board_lock:
+                        _ctp_main_board_cache[(profile, key)] = disk
+                    return disk, "disk"
+            except Exception:
+                logger.warning("CTP main board cache read failed: %s", cache_file, exc_info=True)
+
+    ok, res = _ctp_run_action("main_board", {"products": products},
+                              timeout=75.0, profile=profile)
+    if not ok:
+        stale = None
+        with _ctp_main_board_lock:
+            stale = _ctp_main_board_cache.get((profile, key))
+        if stale is None and cache_file.exists():
+            try:
+                stale = json.loads(cache_file.read_text(encoding="utf-8"))
+            except Exception:
+                stale = None
+        if stale and stale.get("ok") and stale.get("contracts"):
+            stale = dict(stale)
+            stale["cached"] = True
+            stale["stale"] = True
+            stale["live_error"] = res.get("error") or res.get("status")
+            return stale, "stale"
+        return res, "error"
+
+    payload = {"ok": True, "profile": profile, "fetched_at": now,
+               "cached": False, "main_by": res.get("main_by"),
+               "contracts": res.get("contracts", []),
+               "failed": res.get("failed", [])}
+    tmp = cache_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, cache_file)
+    with _ctp_main_board_lock:
+        _ctp_main_board_cache[(profile, key)] = payload
+    return payload, "live"
+
+
+def _ctp_norm_profile(p):
+    """归一 profile；未知 profile 返回 None（fail-closed），绝不静默回落 simnow，
+    防止正式账户 live 请求误连仿真柜台。"""
+    p = str(p or "simnow").strip().lower()
+    return p if p in _CTP_PROFILES else None
 
 
 def _ctp_python() -> str:
@@ -2576,6 +2660,7 @@ def _ctp_run_action(action: str, order: dict, timeout: float = 40.0, profile: st
     env["CTP_ACTION"] = action
     env["CTP_ORDER_JSON"] = json.dumps(order or {}, ensure_ascii=False)
     env["CTP_PROFILE"] = profile
+    env["CTP_TIMEOUT"] = str(timeout)
     try:
         proc = subprocess.run(
             [_ctp_python(), "-u", str(worker)],
@@ -2811,6 +2896,9 @@ def api_ctp_account():
     """
     force = request.args.get("force") in ("1", "true", "yes")
     profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
+    if profile is None:
+        return jsonify({"ok": False, "status": "bad_profile",
+                        "error": "未知/空 CTP profile（5002 仅允许 simnow/citic；实盘走 5006 live-gateway），拒绝静默回落"}), 400
     ok, snap = _ctp_snapshot(force=force, profile=profile)
     if not ok:
         code = 503 if snap.get("status") in ("timeout", "crashed", "logined_false",
@@ -2833,6 +2921,9 @@ def api_ctp_positions():
     """
     force = request.args.get("force") in ("1", "true", "yes")
     profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
+    if profile is None:
+        return jsonify({"ok": False, "status": "bad_profile",
+                        "error": "未知/空 CTP profile（5002 仅允许 simnow/citic；实盘走 5006 live-gateway），拒绝静默回落"}), 400
     ok, snap = _ctp_snapshot(force=force, profile=profile)
     if not ok:
         code = 503 if snap.get("status") in ("timeout", "crashed", "not_configured", "disabled") else 500
@@ -2862,6 +2953,9 @@ def api_ctp_order():
     body = request.get_json(silent=True) or {}
     profile = _ctp_norm_profile(body.get("profile") or body.get("account")
                                 or request.args.get("profile") or request.args.get("account"))
+    if profile is None:
+        return jsonify({"ok": False, "status": "bad_profile",
+                        "error": "未知/空 CTP profile（5002 仅允许 simnow/citic；实盘走 5006 live-gateway），拒绝静默回落"}), 400
     required = ["instrument_id"]
     missing = [k for k in required if not body.get(k)]
     if missing:
@@ -2889,6 +2983,9 @@ def api_ctp_cancel():
     body = request.get_json(silent=True) or {}
     profile = _ctp_norm_profile(body.get("profile") or body.get("account")
                                 or request.args.get("profile") or request.args.get("account"))
+    if profile is None:
+        return jsonify({"ok": False, "status": "bad_profile",
+                        "error": "未知/空 CTP profile（5002 仅允许 simnow/citic；实盘走 5006 live-gateway），拒绝静默回落"}), 400
     if not body.get("instrument_id"):
         return jsonify({"ok": False, "error": "缺少 instrument_id"}), 400
     has_sysid = bool(body.get("order_sys_id"))
@@ -2911,6 +3008,9 @@ def api_ctp_instruments():
     product = (request.args.get("product", "") or "").strip()
     exchange = (request.args.get("exchange", "") or "").strip()
     profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
+    if profile is None:
+        return jsonify({"ok": False, "status": "bad_profile",
+                        "error": "未知/空 CTP profile（5002 仅允许 simnow/citic；实盘走 5006 live-gateway），拒绝静默回落"}), 400
     if not product:
         return jsonify({"ok": False, "error": "缺少 product（品种字母代码，如 IC/IF/AU）"}), 400
     ok, res = _ctp_run_action("instruments",
@@ -2931,6 +3031,9 @@ def api_ctp_main_contract():
     product = (request.args.get("product", "") or "").strip()
     exchange = (request.args.get("exchange", "") or "").strip()
     profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
+    if profile is None:
+        return jsonify({"ok": False, "status": "bad_profile",
+                        "error": "未知/空 CTP profile（5002 仅允许 simnow/citic；实盘走 5006 live-gateway），拒绝静默回落"}), 400
     if not product:
         return jsonify({"ok": False, "error": "缺少 product（如 IC）"}), 400
     ok, res = _ctp_run_action("main_contract",
@@ -2951,6 +3054,48 @@ def api_ctp_main_contract():
     }), 200
 
 
+@app.route("/api/ctp/main-board", methods=["GET"])
+def api_ctp_main_board():
+    """
+    GET /api/ctp/main-board?profile=citic&products=au:SHFE,ag:SHFE,i:DCE
+    一次登录查询全市场合约+行情，按品种分组取 OpenInterest 最大者为主力。
+    products 缺省时返回人工下单常用品种。
+    """
+    profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
+    if profile is None:
+        return jsonify({"ok": False, "status": "bad_profile",
+                        "error": "未知/空 CTP profile（5002 仅允许 simnow/citic；实盘走 5006 live-gateway），拒绝静默回落"}), 400
+    default_products = [
+        ("au", "SHFE"), ("ag", "SHFE"), ("cu", "SHFE"), ("al", "SHFE"),
+        ("rb", "SHFE"), ("hc", "SHFE"), ("fu", "SHFE"), ("lu", "INE"),
+        ("sc", "INE"), ("i", "DCE"), ("jm", "DCE"), ("j", "DCE"),
+        ("IF", "CFFEX"), ("IC", "CFFEX"), ("IH", "CFFEX"), ("IM", "CFFEX"),
+    ]
+    raw = (request.args.get("products", "") or "").strip()
+    products = []
+    if raw:
+        for part in raw.split(","):
+            item = part.strip()
+            if not item:
+                continue
+            if ":" not in item:
+                return jsonify({"ok": False, "status": "bad_products",
+                                "error": f"products 项格式应为 product:exchange，收到 {item}"}), 400
+            product, exchange = item.split(":", 1)
+            products.append({"product": product.strip(), "exchange": exchange.strip()})
+    else:
+        products = [{"product": p, "exchange": e} for p, e in default_products]
+    force_refresh = str(request.args.get("refresh", "") or "").lower() in ("1", "true", "yes")
+    payload, source = _ctp_main_board_cached(profile, products, force=force_refresh)
+    if source == "error":
+        code = 503 if payload.get("status") in ("timeout", "crashed", "disabled", "not_configured") else 400
+        return jsonify(payload), code
+    payload = dict(payload)
+    payload["cache_source"] = source
+    payload["cached"] = source in ("memory", "disk", "stale")
+    return jsonify(payload), 200
+
+
 @app.route("/api/ctp/depth", methods=["GET"])
 def api_ctp_depth():
     """
@@ -2959,6 +3104,9 @@ def api_ctp_depth():
     """
     instrument = (request.args.get("instrument", "") or "").strip()
     profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
+    if profile is None:
+        return jsonify({"ok": False, "status": "bad_profile",
+                        "error": "未知/空 CTP profile（5002 仅允许 simnow/citic；实盘走 5006 live-gateway），拒绝静默回落"}), 400
     if not instrument:
         return jsonify({"ok": False, "error": "缺少 instrument（合约代码，如 au2610）"}), 400
     ok, res = _ctp_run_action("depth",
@@ -2978,6 +3126,9 @@ def api_ctp_trades():
     """
     instrument = (request.args.get("instrument", "") or "").strip()
     profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
+    if profile is None:
+        return jsonify({"ok": False, "status": "bad_profile",
+                        "error": "未知/空 CTP profile（5002 仅允许 simnow/citic；实盘走 5006 live-gateway），拒绝静默回落"}), 400
     order = {"instrument_id": instrument, "profile": profile} if instrument else {"profile": profile}
     ok, res = _ctp_run_action("trades", order, timeout=40.0, profile=profile)
     if not ok:
@@ -3052,7 +3203,8 @@ def api_ib_order():
     """
     POST /api/ib/order — IB paper 期货/股票模拟下单（复用 TWS/Gateway 连接）。
     Body: {"symbol":"MNQ","action":"BUY|SELL|CLOSE","quantity":1,
-           "sec_type":"FUT","exchange":null,"close_position":false}
+           "sec_type":"FUT","exchange":null,"close_position":false,
+           "order_type":"MKT|LMT","limit_price":0,"tif":"DAY"}
     走 OrderManager.place + RiskGate(ADVISORY)，后台线程提交（避免事件循环嵌套死锁），
     与飞书人工下单同一路径。同步等待 <=65s。
     """
@@ -3065,6 +3217,31 @@ def api_ib_order():
         return jsonify({"ok": False, "error": "缺少 symbol（如 MNQ/GC）"}), 400
     if not close_position and qty <= 0:
         return jsonify({"ok": False, "error": "quantity 必须为正数（CLOSE 除外）"}), 400
+
+    # 订单类型归一 + fail-closed 校验：限价必须有正的限价，绝不静默降级为市价
+    order_type = str(body.get("order_type", "MKT") or "MKT").strip().upper()
+    if order_type not in ("MKT", "LMT", "STP", "STP LMT"):
+        return jsonify({"ok": False, "status": "bad_order_type",
+                        "error": f"不支持的 order_type: {order_type}"}), 400
+
+    def _as_price(key):
+        try:
+            v = float(body.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return v if v > 0 else 0.0
+
+    limit_price = _as_price("limit_price")
+    stop_price = _as_price("stop_price")
+    tif = str(body.get("tif", "DAY") or "DAY").strip().upper()
+
+    if not close_position:
+        if order_type in ("LMT", "STP LMT") and limit_price <= 0:
+            return jsonify({"ok": False, "status": "missing_limit_price",
+                            "error": f"{order_type} 订单必须提供正的 limit_price（拒绝静默降级市价）"}), 400
+        if order_type in ("STP", "STP LMT") and stop_price <= 0:
+            return jsonify({"ok": False, "status": "missing_stop_price",
+                            "error": f"{order_type} 订单必须提供正的 stop_price"}), 400
 
     try:
         from client.ib_connection import get_ib_connection
@@ -3083,6 +3260,10 @@ def api_ib_order():
             ib, symbol, action, qty,
             exchange=exchange, sec_type=sec_type,
             close_position=close_position,
+            order_type=order_type,
+            limit_price=limit_price if limit_price > 0 else None,
+            stop_price=stop_price if stop_price > 0 else None,
+            tif=tif,
         )
         res = future.result(timeout=65)
     except Exception as e:  # noqa: BLE001
@@ -3093,10 +3274,77 @@ def api_ib_order():
     if res is None:
         return jsonify({"ok": False, "status": "timeout", "error": "Order timed out"}), 504
     status = str(res.get("status", "")).lower()
-    ok = status in ("filled", "submitted", "ok", "pending") and not res.get("error")
+    # PreSubmitted = 限价单已被柜台受理、挂单中（未成交），同样算成功
+    ok = status in ("filled", "submitted", "presubmitted", "ok", "pending") \
+        and not res.get("error")
     logger.info("[IB-ORDER] %s %s %s -> %s", action, symbol, qty, res.get("status"))
     return jsonify({"ok": ok, "status": res.get("status", "submitted"),
                     "action_result": res}), 200
+
+
+@app.route("/api/ib/cancel", methods=["POST"])
+def api_ib_cancel():
+    """
+    POST /api/ib/cancel — 撤销 IB paper 挂单（限价单 E2E 测试用）。
+    Body: {"order_id": 123} 或 {"cancel_all": true}
+    仅撤本连接可见的活动挂单（PreSubmitted/Submitted/PendingSubmit）。
+    """
+    body = request.get_json(silent=True) or {}
+    cancel_all = bool(body.get("cancel_all", False))
+    try:
+        order_id = int(body.get("order_id")) if body.get("order_id") is not None else None
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "status": "bad_order_id",
+                        "error": "order_id 必须是整数"}), 400
+    if not cancel_all and order_id is None:
+        return jsonify({"ok": False, "status": "missing_param",
+                        "error": "需提供 order_id 或 cancel_all=true"}), 400
+    try:
+        from client.ib_connection import get_ib_connection
+        ib = get_ib_connection()
+        if ib is None or not ib.isConnected():
+            return jsonify({"ok": False, "status": "ib_disconnected",
+                            "error": "IB Gateway 未连接"}), 503
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "status": "ib_error",
+                        "error": f"IB 连接异常: {e}"}), 503
+
+    active = {"presubmitted", "submitted", "pendingsubmit", "apipending", "active"}
+
+    def _cancel_job():
+        from client.ib_connection import get_ib_manager
+        manager = get_ib_manager()
+
+        def _do():
+            targets = []
+            for t in ib.openTrades():
+                st = str(t.orderStatus.status or "").lower()
+                if st not in active:
+                    continue
+                if cancel_all or t.order.orderId == order_id:
+                    targets.append(t)
+            cancelled = []
+            for t in targets:
+                ib.cancelOrder(t.order)
+                cancelled.append(t.order.orderId)
+            return cancelled
+
+        return manager.run_sync(_do, timeout=20)
+
+    try:
+        fut = _order_executor.submit(_cancel_job)
+        cancelled = fut.result(timeout=30)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[IB-CANCEL] 失败: %s", e)
+        return jsonify({"ok": False, "status": "error",
+                        "error": f"{type(e).__name__}: {e}"}), 503
+
+    if not cancel_all and order_id not in cancelled:
+        return jsonify({"ok": False, "status": "not_found",
+                        "error": f"未找到活动挂单 order_id={order_id}"}), 404
+    logger.info("[IB-CANCEL] cancelled=%s", cancelled)
+    return jsonify({"ok": True, "status": "cancelled",
+                    "cancelled": cancelled}), 200
 
 
 @app.route("/api/okx/account", methods=["GET"])

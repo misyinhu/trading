@@ -1,0 +1,142 @@
+name: Kanban Test Suite
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ========== 快速单元测试 ==========
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-mock pytest-asyncio pytest-xdist pytest-randomly
+      
+      - name: Run unit tests (fast)
+        run: |
+          pytest tests/ -v \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --timeout=30 \
+            -m "not slow and not e2e" \
+            -x
+      
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: true
+  
+  # ========== Streamlit 页面测试 ==========
+  streamlit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-mock streamlit
+      
+      - name: Run Streamlit component tests
+        run: |
+          pytest tests/component/streamlit/ -v \
+            --timeout=60 \
+            -x
+      
+      # 使用 Streamlit App Action 进行 smoke 测试
+      - name: Streamlit App Smoke Test
+        uses: streamlit/streamlit-app-action@v0
+        with:
+          app-path: app.py
+          skip-smoke: false
+  
+  # ========== Webhook 服务测试 ==========
+  webhook-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-mock pytest-asyncio flask requests
+      
+      - name: Run webhook component tests
+        run: |
+          pytest tests/component/webhook/ -v \
+            --timeout=60 \
+            -x
+  
+  # ========== 完整测试 (每日) ==========
+  full-test-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'schedule'  # 每天凌晨运行
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install all dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-mock pytest-asyncio pytest-xdist pytest-randomly pytest-timeout
+          pip install streamlit flask requests ib_insync pandas numpy
+      
+      - name: Run complete test suite
+        run: |
+          pytest tests/ -v \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=term \
+            --cov-fail-under=80 \
+            --timeout=120 \
+            -m "not e2e"
+      
+      - name: Upload full coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: true

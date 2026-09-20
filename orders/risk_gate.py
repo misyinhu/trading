@@ -33,6 +33,17 @@ class OrderContext:
     correlation: Optional[float] = None
     open_positions: int = 0
     strategy: str = ""
+    # IB 下单额外参数
+    sec_type: str = ""
+    conId: Optional[int] = None
+    close_position: bool = False
+    outside_rth: bool = True
+    signal_id: str = ""  # 关联的信号ID，用于成交回写
+    # 订单类型与价格（防止限价单被静默降级为市价）
+    order_type: str = "MKT"   # MKT / LMT / STP / STP LMT
+    limit_price: Optional[float] = None
+    stop_price: Optional[float] = None
+    tif: str = "DAY"
 
 
 @dataclass

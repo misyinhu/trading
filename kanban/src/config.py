@@ -46,9 +46,25 @@ config = load_shared_config()
 QUANT_CORE_URL = config.get("quant_core", {}).get("url", "http://100.82.238.11:8005")
 CLIENT_ID = config.get("quant_core", {}).get("client_id", "10")
 
-# 套利分析参数
+# ─── RiskGate Z-Score 阈值 ───────────────────────────────────────────
+_risk_gate = config.get("risk_gate", {})
+
+def get_zscore_alert_threshold() -> float:
+    """警报触发阈值（对应规则入场 ±1.0）"""
+    return _risk_gate.get("zscore_alert", 1.0)
+
+def get_zscore_exit_threshold() -> float:
+    """止损阈值（对应规则回归 ±0.5）"""
+    return _risk_gate.get("zscore_exit", 0.5)
+
+def get_zscore_warn() -> float:
+    return _risk_gate.get("zscore_warn", 3.0)
+
+def get_zscore_critical() -> float:
+    return _risk_gate.get("zscore_critical", 4.0)
+
+# 套利分析参数（Z-Score 阈值已迁移到 risk_gate.zscore_alert）
 ARBITRAGE_DEFAULTS = {
-    "zscore_threshold": 3.0,  # Z-Score 触发阈值
     "correlation_threshold": 0.8,  # 相关性触发阈值
     "rsi_divergence_threshold": 20,  # RSI 背离阈值
     "correlation_window": 20,  # 滚动相关性窗口
@@ -97,3 +113,38 @@ def get_okx_flag() -> str:
 def get_okx_pairs() -> list:
     """获取 OKX 交易对配置"""
     return config.get("okx", {}).get("pairs", [])
+
+
+# ─── SimNow / CTP 配置 ───────────────────────────────────────────
+
+def get_simnow_flag() -> str:
+    """获取 SimNow 交易模式: sim 或 live"""
+    return config.get("simnow", {}).get("flag", "sim")
+
+
+def get_simnow_md_server() -> str:
+    return config.get("simnow", {}).get("md_server", "tcp://218.80.240.6:20002")
+
+
+def get_simnow_td_server() -> str:
+    return config.get("simnow", {}).get("td_server", "tcp://218.80.240.6:20003")
+
+
+def get_simnow_broker_id() -> str:
+    return config.get("simnow", {}).get("broker_id", "9999")
+
+
+def get_simnow_auth_code() -> str:
+    return config.get("simnow", {}).get("auth_code", "0000000000")
+
+
+def get_simnow_user() -> str:
+    prefix = "SIMNOW_SIM" if get_simnow_flag() == "sim" else "SIMNOW_LIVE"
+    secrets = get_secrets()
+    return secrets.get(f"{prefix}_USER", "")
+
+
+def get_simnow_password() -> str:
+    prefix = "SIMNOW_SIM" if get_simnow_flag() == "sim" else "SIMNOW_LIVE"
+    secrets = get_secrets()
+    return secrets.get(f"{prefix}_PASSWORD", "")

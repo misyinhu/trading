@@ -3,7 +3,6 @@
 
 import os
 import sys
-import json
 from typing import List, Dict, Any, Optional
 from ib_insync import IB
 
@@ -15,8 +14,6 @@ try:
     ensure_venv()
 except ImportError:
     pass
-
-from client.ibkr_client import get_client_id, IBKR_HOST, IBKR_PORT
 
 ib = IB()
 result = {}

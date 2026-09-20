@@ -32,7 +32,7 @@ def _ib_sync(ib: IB, fn, timeout: float = 30.0):
 
 def get_position_contract(ib, symbol, action=None):
     try:
-        positions = _ib_sync(ib, lambda: ib.positions(), timeout=10)
+        positions = _ib_sync(ib, lambda: ib.positions(), timeout=30)
         matching_positions = [pos for pos in positions if pos.contract.symbol == symbol]
         if not matching_positions:
             return None
@@ -116,7 +116,7 @@ def place_order_with_retry(ib, contract, order, action, quantity):
     if any(x in error_msg for x in ["201", "321", "permission", "physical delivery"]):
         symbol = contract.symbol
         base_contract = Future(symbol, exchange=contract.exchange, currency=contract.currency)
-        details = _ib_sync(ib, lambda: ib.reqContractDetails(base_contract), timeout=10)
+        details = _ib_sync(ib, lambda: ib.reqContractDetails(base_contract), timeout=30)
         main_contract = select_main_contract(details, symbol, ib, prefer_position=False)
         if main_contract:
             trade = _ib_sync(ib, lambda: ib.placeOrder(main_contract, order), timeout=30)
@@ -162,7 +162,15 @@ def _place_order_impl(
     tif: str = "DAY",
 ) -> Dict[str, Any]:
     """实际下单逻辑"""
-    futures_set = {"GC", "MGC", "ES", "MES", "NQ", "MNQ", "YM", "MYM", "ZB", "ZN"}
+    futures_set = {
+        "GC", "MGC",   # Gold
+        "ES", "MES",   # E-mini S&P
+        "NQ", "MNQ",   # E-mini Nasdaq
+        "YM", "MYM",   # E-mini Dow
+        "ZB", "ZN",    # Treasury
+        "PL", "PA",     # Platinum / Palladium
+        "HO",          # Heating Oil
+    }
     crypto_set = {"BTC", "ETH", "DOGE"}
     if sec_type is None:
         sec_type = "FUT" if symbol in futures_set else "CRYPTO" if symbol in crypto_set else "STK"
@@ -199,7 +207,7 @@ def _place_order_impl(
 
     # ── 平仓模式 ───────────────────────────────────────────────────────────
     if close_position:
-        positions = _ib_sync(ib, lambda: ib.positions(), timeout=10)
+        positions = _ib_sync(ib, lambda: ib.positions(), timeout=30)
         matching = [pos for pos in positions if pos.contract.symbol == symbol]
         if not matching:
             return {"error": f"未找到 {symbol} 的持仓"}
@@ -288,7 +296,7 @@ def _place_order_impl(
             contract = Contract(conId=conId, exchange=exchange)
         else:
             base_contract = Future(symbol, exchange=exchange, currency=currency)
-            details = _ib_sync(ib, lambda: ib.reqContractDetails(base_contract), timeout=10)
+            details = _ib_sync(ib, lambda: ib.reqContractDetails(base_contract), timeout=30)
             print(f"[DEBUG] 合约详情返回: {len(details) if details else 'None'}", file=sys.stderr, flush=True)
             contract = select_main_contract(details, symbol, ib) if use_main_contract else (details[0].contract if details else base_contract)
     elif sec_type == "CASH":
@@ -325,11 +333,11 @@ def _place_order_impl(
         if order_type == "MKT":
             order = MarketOrder(**order_kwargs)
         elif order_type == "LMT":
-            order = LimitOrder(limitPrice=limit_price, **order_kwargs)
+            order = LimitOrder(lmtPrice=limit_price, **order_kwargs)
         elif order_type == "STP":
             order = StopOrder(stopPrice=stop_price, **order_kwargs)
         elif order_type == "STP LMT":
-            order = StopLimitOrder(limitPrice=limit_price, stopPrice=stop_price, **order_kwargs)
+            order = StopLimitOrder(lmtPrice=limit_price, stopPrice=stop_price, **order_kwargs)
         else:
             order = MarketOrder(**order_kwargs)
         order.tif = tif

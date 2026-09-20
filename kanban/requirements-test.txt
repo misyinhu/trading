@@ -1,0 +1,15 @@
+# 测试依赖
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-mock>=3.12.0
+pytest-asyncio>=0.23.0
+pytest-xdist>=3.5.0
+pytest-randomly>=3.15.0
+pytest-timeout>=2.2.0
+
+# 可选 - Flask/Webhook 测试
+flask>=3.0.0
+requests>=2.31.0
+
+# 可选 - Streamlit 测试
+streamlit>=1.28.0

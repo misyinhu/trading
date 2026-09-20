@@ -11,10 +11,18 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import faulthandler
 from pathlib import Path
 
+faulthandler.enable()
+
 from flask import Flask
+
+# 必须在任何 ctp_client.* 导入之前：md 进程只允许加载 thostmduserapi，
+# 禁止 trader 原生库同驻（见 ctp_client/ctp_connector.py CTP_MD_ONLY）。
+os.environ.setdefault("CTP_MD_ONLY", "1")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -38,7 +46,11 @@ def build_ctp_profiles(names: list[str]) -> dict:
             "请分别起 5003/5004 两个进程")
     import os
     os.environ["CTP_PROFILE"] = names[0]
-    from ctp_client.ctp_worker import _load_config
+    # 不导入 ctp_client.ctp_worker：该模块模块级 `import thosttraderapi`，
+    # 会让 md 进程同时驻留 trader+md 两套原生 se 库，开盘后 md 回调线程
+    # 原生 abort（2026-09-18 simnow 实测 <no Python frame>，2800+ 次崩溃）。
+    # 配置装配只需读 yaml/secrets/env，内联一份只读实现，彻底不碰 trader 绑定。
+    from ctp_md.md_config import load_md_config as _load_config
 
     out: dict = {}
     name = names[0]

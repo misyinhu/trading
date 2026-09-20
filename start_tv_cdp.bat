@@ -1,2 +1,3 @@
 @echo off
-start "" "C:\Program Files\WindowsApps\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\TradingView.exe" --remote-debugging-port=9222
+REM Launch the TV-Extracted portable build with CDP on 9224 (matches config/settings.yaml tv_cdp.port and kanban)
+start "" "C:\Users\wang\Desktop\TV-Extracted\TradingView.exe" --remote-debugging-port=9224

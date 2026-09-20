@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          pip install ruff
+
+      - name: Lint
+        run: ruff check .
+
+  type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          pip install mypy
+
+      - name: Type check
+        run: mypy notify kanban client tests --ignore-missing-imports
+
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          pip install pytest pytest-cov
+          pip install -e .
+
+      - name: Run unit tests
+        run: pytest tests/unit -v --cov=notify --cov=kanban --cov=client --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: success()
+
+  integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          pip install pytest requests
+
+      - name: Run integration tests
+        run: pytest tests/integration -v
+
+  e2e-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          pip install flask streamlit requests pytest pytest-playwright
+          playwright install --with-deps chromium
+
+      - name: Start Kanban Streamlit & run E2E tests
+        run: |
+          # Start Kanban Streamlit on port 8501 (for navigation tests)
+          nohup streamlit run kanban/app.py --server.port 8501 --server.headless > /tmp/kanban.log 2>&1 &
+          KANBAN_PID=$!
+          echo "Kanban PID=$KANBAN_PID"
+
+          # Wait for Kanban server to be ready
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:8501 > /dev/null 2>&1; then
+              echo "Kanban server ready!"
+              break
+            fi
+            sleep 1
+          done
+
+          # Run webhook E2E tests against remote server
+          export TRADING_SERVER_URL="http://alerts.qiaoge.top"
+          pytest tests/e2e/webhook_integration -v --timeout=60
+
+          # Run navigation E2E tests against local Streamlit
+          export BASE_URL="http://localhost:8501"
+          pytest tests/e2e/navigation -v --timeout=60
+
+          # Cleanup
+          kill $KANBAN_PID 2>/dev/null || true

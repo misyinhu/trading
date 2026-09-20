@@ -59,6 +59,30 @@ def get_ibkr_host() -> str:
     return get("ibkr.host", "127.0.0.1")
 
 
+def get_ibkr_client_id() -> int:
+    """固定下单 clientId（默认 100）。
+
+    桥的所有 IB 报单/撤单长期复用同一 clientId，避免每次启动在 2-99 扫描漂移、
+    与僵尸会话互相抢占。默认 100（2 是常用默认/测试位，避开）；
+    可用环境变量 IBKR_CLIENT_ID 或配置 ibkr.client_id 覆盖。
+    注意：clientId=0 是只读主连接，禁止用于下单。
+    """
+    import os
+    env = os.environ.get("IBKR_CLIENT_ID")
+    if env:
+        try:
+            cid = int(env)
+            if cid > 0:
+                return cid
+        except ValueError:
+            pass
+    try:
+        cid = int(get("ibkr.client_id", 100))
+        return cid if cid > 0 else 100
+    except (TypeError, ValueError):
+        return 100
+
+
 def get_ibkr_port() -> int:
     """获取 IB Gateway 端口"""
     # 优先从 environments 配置获取（支持本地/远程切换）
@@ -168,11 +192,16 @@ def get_project_root() -> str:
 
 
 def get_volcengine_config() -> Dict[str, Any]:
-    """获取火山引擎配置"""
+    """获取火山引擎（方舟 Ark）配置。
+
+    凭证统一走 ARK_API_KEY（env > .streamlit/secrets.toml > settings.yaml），
+    端点/模型对齐 llm-gateway 的 ark provider：plan/v3 + ark-code-latest。
+    旧 coding/v3 + doubao-seed-2.0-code（ARK_CODING_API_KEY）路径已废弃。
+    """
     return {
-        "api_key": get("volcengine.api_key", ""),
-        "base_url": get("volcengine.base_url", "https://ark.cn-beijing.volces.com/api/coding/v3"),
-        "model": get("volcengine.model", "doubao-seed-2.0-code"),
+        "api_key": _secret("ARK_API_KEY", default=get("volcengine.api_key", "")),
+        "base_url": get("volcengine.base_url", "https://ark.cn-beijing.volces.com/api/plan/v3"),
+        "model": get("volcengine.model", "ark-code-latest"),
         "enabled": get("volcengine.enabled", False),
     }
 

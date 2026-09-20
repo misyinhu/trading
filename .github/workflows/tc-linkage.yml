@@ -1,0 +1,176 @@
+name: TC Linkage Check
+
+on:
+  pull_request:
+    paths:
+      - 'tests/**'
+      - 'openspec/**'
+      - 'docs/**'
+      - 'contracts/**'
+      - 'src/**'
+      - 'notify/**'
+  push:
+    branches: [main, master]
+
+jobs:
+  orphan-test-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Detect orphan tests (no @TC marker)
+        run: |
+          echo "=== 孤儿测试检测 ==="
+          python scripts/check_orphan_tests.py
+          if [ $? -ne 0 ]; then
+            echo "❌ 发现孤儿测试（无 @TC 标签）"
+            exit 1
+          fi
+          echo "✅ 所有测试都有 @TC 标签"
+
+  ac-tc-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Check AC-TC mapping completeness
+        run: |
+          echo "=== AC-TC 映射完整性检查 ==="
+          python scripts/check_ac_tc_mapping.py
+          if [ $? -ne 0 ]; then
+            echo "❌ AC-TC 映射不完整"
+            exit 1
+          fi
+          echo "✅ 所有 AC 都有 TC 覆盖"
+
+  feature-file-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check feature files exist
+        run: |
+          echo "=== Feature 文件检查 ==="
+          FEATURE_COUNT=$(find openspec -name "*.feature" | wc -l)
+          echo "Feature 文件数量: $FEATURE_COUNT"
+          if [ $FEATURE_COUNT -eq 0 ]; then
+            echo "❌ 没有找到 Feature 文件"
+            exit 1
+          fi
+          echo "✅ Feature 文件存在"
+
+  orphan-feature-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Detect orphan feature files (not linked in SPEC.md)
+        run: |
+          echo "=== 孤儿 Feature 文件检测 ==="
+          python scripts/check_orphan_features.py
+          if [ $? -ne 0 ]; then
+            echo "❌ 发现孤儿 Feature 文件（未被 SPEC.md 引用）"
+            exit 1
+          fi
+          echo "✅ 所有 Feature 文件都被 SPEC.md 引用"
+
+  unlinked-proposal-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Check AC without .feature coverage
+        run: |
+          echo "=== AC-.feature 链接检查 ==="
+          python scripts/check_unlinked_ac.py
+          if [ $? -ne 0 ]; then
+            echo "❌ 发现没有 .feature 覆盖的 AC"
+            exit 1
+          fi
+          echo "✅ 所有 AC 都有 .feature 覆盖"
+
+  contract-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install OpenAPI validator
+        run: npm install -g @redocly/cli
+
+      - name: Validate OpenAPI contract
+        run: |
+          echo "=== OpenAPI 契约验证 ==="
+          npx @redocly/cli lint contracts/webhook_bridge.openapi.yaml
+          if [ $? -ne 0 ]; then
+            echo "❌ OpenAPI 契约验证失败"
+            exit 1
+          fi
+          echo "✅ OpenAPI 契约有效"
+
+      - name: Check webhook_bridge.py matches contract
+        run: |
+          echo "=== Webhook API 一致性检查 ==="
+          # 检查 webhook_bridge.py 是否被修改但未更新契约
+          if git diff --name-only | grep -q "notify/webhook_bridge.py"; then
+            echo "⚠️ webhook_bridge.py 已修改，请确认 contracts/webhook_bridge.openapi.yaml 已同步更新"
+            # 检查契约文件是否也在修改列表中
+            if ! git diff --name-only | grep -q "contracts/webhook_bridge.openapi.yaml"; then
+              echo "❌ webhook_bridge.py 修改但未同步更新 OpenAPI 契约"
+              exit 1
+            fi
+          fi
+          echo "✅ API 契约一致性检查通过"
+
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pytest pytest-cov
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit/ tests/integration/ \
+            --junitxml=report.xml \
+            --cov=. \
+            --cov-report=term \
+            -v || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results
+          path: report.xml

@@ -5,9 +5,9 @@ import os
 import json
 import requests
 
-# 配置
-BASE_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"
-API_KEY = "8f341f98-c6d4-4a03-b205-0089f515f928"
+# 配置：统一走 ARK_API_KEY（plan/v3 + ark-code-latest），不再硬编码凭证
+BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
+API_KEY = os.environ.get("ARK_API_KEY", "")
 
 # 测试消息
 TEST_MESSAGES = [
@@ -16,8 +16,10 @@ TEST_MESSAGES = [
     "买入1手GC",
 ]
 
-def chat(prompt: str, model: str = "doubao-seed-2.0-code") -> dict:
+def chat(prompt: str, model: str = "ark-code-latest") -> dict:
     """调用豆包 API"""
+    if not API_KEY:
+        raise RuntimeError("未设置 ARK_API_KEY 环境变量")
     url = f"{BASE_URL}/chat/completions"
     headers = {
         "Authorization": f"Bearer {API_KEY}",
@@ -63,7 +65,7 @@ def test_trading_intent():
     print("\n=== 交易意图识别测试 ===\n")
     for msg in test_cases:
         payload = {
-            "model": "doubao-seed-2.0-code",
+            "model": "ark-code-latest",
             "messages": [
                 {"role": "system", "content": TRADING_PROMPT},
                 {"role": "user", "content": msg}

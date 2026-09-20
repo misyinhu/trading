@@ -1,6 +1,6 @@
 # Trading 架构整合设计文档
 
-> 状态：待审核 | 日期：2026-08-24 | 作者：Mavis
+> 状态：已实施 | 日期：2026-08-24 | 部署：2026-08-25 | 作者：Mavis
 
 ## 一、背景与目标
 
@@ -366,3 +366,93 @@ quant-agent/
 - 回测参数→实盘配置自动化（cf-index-monitor 参数手动搬运）
 - quant-edge-pro 的高密度 UI/全键盘交互（需前端重写）
 - 策略 Marketplace 和 SaaS 分层（quant-edge-pro spec 远期规划）
+
+---
+
+## 九、实施验收记录（2026-08-25）
+
+### 部署清单
+
+| 文件 | winclaw 路径 | 说明 |
+|------|-------------|------|
+| `orders/risk_gate.py` | `C:\projects\trading\orders\risk_gate.py` | 5条风控规则 |
+| `orders/order_manager.py` | `C:\projects\trading\orders\order_manager.py` | 统一订单入口 |
+| `notify/signal_handler.py` | `C:\projects\trading\notify\signal_handler.py` | 信号全流程处理 |
+| `notify/webhook_bridge.py` | `C:\projects\trading\notify\webhook_bridge.py` | 新增 5 端点 (+health/full, +3 signals) |
+| `config/settings.yaml` | `C:\projects\trading\config\settings.yaml` | 新增 risk_gate 配置段 |
+| `data/signals.jsonl` | `C:\projects\trading\data\signals.jsonl` | 信号存储（运行时生成） |
+| `scripts/smoke_test.py` | `C:\projects\trading\scripts\smoke_test.py` | 4端点烟雾测试 |
+| `health_check.bat` | `C:\projects\trading\health_check.bat` | 自愈脚本（每5分钟+自动重启） |
+| `tests/legacy/test_risk_gate.py` | `C:\projects\trading\tests\legacy\test_risk_gate.py` | 9条单元测试 |
+| `tests/legacy/test_signal_api.py` | `C:\projects\trading\tests\legacy\test_signal_api.py` | 6条集成测试 |
+
+### 验收结果
+
+| 验收项 | 状态 | 证据 |
+|--------|------|------|
+| `/health` → risk_gate(5 rules)=ok | ✅ | HTTP 200, components all ok |
+| `/health` → order_manager=ok | ✅ | HTTP 200 |
+| `/health` → signal_api=ok | ✅ | HTTP 200 |
+| `/health/full` → IB Gateway :4002 已连接 | ✅ | connected=true, clientId=999 |
+| `scripts/smoke_test.py` 4/4 PASS | ✅ | exit 0 |
+| Flask :5002 运行中 (PID 5504) | ✅ | `netstat -ano` 确认 |
+| 测试 18/18 PASS (RiskGate+OrderManager+SignalAPI) | ✅ | pytest -v |
+| Windows 任务计划 `TradingHealthCheck` | ✅ | 每5分钟，3次重试→杀进程重启 |
+| OrderManager 下单路径归并 (2026-08-25) | ✅ | 6路径→1入口，见下方详表 |
+
+### 下单路径归并详情 (2026-08-25)
+
+| # | 路径 | 文件 | 改后 | 模式 |
+|---|------|------|------|------|
+| 1 | Agent 信号 | `signal_handler.py` | `OrderManager.place()` | strict |
+| 2 | feishu NL 下单 (IB) | `webhook_bridge.py:_submit_order_in_background()` | `OrderManager.place()` | advisory |
+| 3 | TV webhook (IB) | `webhook_bridge.py:_submit_order_in_background()` | `OrderManager.place()` | advisory |
+| 4 | OKX webhook | `webhook_bridge.py:_submit_okx_order()` | `RiskGate.final_check()` 前置 | strict |
+| 5 | OKX 配对交易 | `webhook_bridge.py:_submit_pair_trade()` | 调 `_submit_okx_order()` | strict |
+| 6 | OKX grid_bot | `okx_client/grid_bot.py` | `RiskGate.final_check()` 前置 | strict |
+| 7 | OKX 背离监控 | `crypto_divergence/live_okx.py:submit()` | `RiskGate.final_check()` 前置 | strict |
+
+### 运营自愈链路
+
+```
+Windows Task Scheduler (每5分钟)
+  → health_check.bat
+    → python scripts/smoke_test.py
+      → 失败(3次重试) → taskkill /F /IM python.exe
+                      → start /B python notify\webhook_bridge.py
+```
+
+### StrategyRegistry — 策略信号校验与多腿映射 (2026-08-25)
+
+**文件**: `orders/strategy_registry.py` + `notify/signal_handler.py`
+
+**新增测试**: `tests/legacy/test_strategy_registry.py` (10条)
+
+**注册策略**:
+
+| 策略名 | 交易所 | 类型 | 必填参数 | 参数约束 |
+|--------|--------|------|---------|---------|
+| `fu-lu-spread` | IB | 多腿 spread | zscore | zscore ∈ [-4,4], correlation ≥ 0.7 |
+| `doge-grid` | OKX | 单腿 | — | zscore ∈ [-4,4] |
+| `crypto-divergence` | OKX | 单腿 | — | zscore ∈ [-4,4] |
+| `z120-spread` | IB | 单腿 | — | zscore ∈ [-4,4] |
+
+**信号流程**:
+```
+POST /api/signals {strategy:"fu-lu-spread", direction:"long", zscore:2.1}
+    ↓
+StrategyRegistry.validate() — 校验参数范围
+    ↓
+RiskGate.pre_check() — 风控预检
+    ↓ (reviewed)
+人确认 POST /api/signals/<id>/confirm
+    ↓
+StrategyRegistry.build_order_contexts() — 展开多腿
+    → [OrderContext(FU,BUY,1), OrderContext(LU,SELL,0.68)]
+    ↓
+RiskGate.final_check() + OrderManager.place() — 每条腿
+    ↓
+成交回报 → 飞书通知
+```
+
+**向后兼容**: 不带 `strategy` 字段的信号保持原有行为。

@@ -40,6 +40,12 @@ _CTP_SWG_PATHS = {
         "CTP_SWIG_PATH_CITIC",
         r"C:\tmp\ctp_api\ctp_swig_build-6.5.1cp\ctp_api",
     ),
+    # 正式版真实账户：中信正式前置走【标准 CTP 协议】，6.7.7_CP 评测绑定回 [4040]
+    # decode err；实测标准 6.7.11.1 可正常握手/登录/查询/报单（账号 821350082）。
+    "live": os.environ.get(
+        "CTP_SWIG_PATH_LIVE",
+        r"C:\tmp\ctp_api\ctp_swig_build-6.7.11.1\ctp_api",
+    ),
 }
 _profile_early = os.environ.get("CTP_PROFILE", "simnow").strip().lower()
 _CTP_SWG_PATH = _CTP_SWG_PATHS.get(_profile_early, _CTP_SWG_PATHS["simnow"])
@@ -91,6 +97,20 @@ _PROFILES = {
                 "auth_code": "CITIC_CTP_AUTH_CODE", "app_id": "CITIC_CTP_APP_ID",
                 "broker_id": "CITIC_CTP_BROKER_ID", "td_server": "CITIC_CTP_TD_SERVER",
                 "md_server": "CITIC_CTP_MD_SERVER"},
+    },
+    "live": {
+        # 正式版真实账户（凭证 LIVE_CTP_*，生产前置上海电信）。
+        # 2026-09-17 人类授权：仅【人工报单/撤单】，agent 不得自动下单
+        # （自动单在桥层/信号路径拦截；worker 只忠实执行柜台指令）。
+        "block": "live",
+        "secrets": {"user": "LIVE_CTP_USER", "password": "LIVE_CTP_PASSWORD",
+                    "auth_code": "LIVE_CTP_AUTH_CODE", "app_id": "LIVE_CTP_APP_ID",
+                    "broker_id": "LIVE_CTP_BROKER_ID", "td_server": "LIVE_CTP_TD_SERVER",
+                    "md_server": "LIVE_CTP_MD_SERVER"},
+        "env": {"user": "LIVE_CTP_USER", "password": "LIVE_CTP_PASSWORD",
+                "auth_code": "LIVE_CTP_AUTH_CODE", "app_id": "LIVE_CTP_APP_ID",
+                "broker_id": "LIVE_CTP_BROKER_ID", "td_server": "LIVE_CTP_TD_SERVER",
+                "md_server": "LIVE_CTP_MD_SERVER"},
     },
 }
 
@@ -170,6 +190,55 @@ def _num(p, *names):
     return None
 
 
+# CTP 柜台的中文 StatusMsg 是 GBK 字节，部分 SWIG 绑定按 latin-1/utf-8 解码会变乱码
+# （如实盘中信返回 "全部成交" 被解成 ǫ... ）。这里把常见 mojibake 还原回中文。
+_STATUS_FIX = {
+    "0": "\u5168\u90e8\u6210\u4ea4",
+    "1": "\u90e8\u5206\u6210\u4ea4\uff0c\u961f\u5217\u4e2d",
+    "2": "\u90e8\u5206\u6210\u4ea4\uff0c\u672a\u5728\u961f\u5217",
+    "3": "\u672a\u6210\u4ea4\uff0c\u961f\u5217\u4e2d",
+    "4": "\u672a\u6210\u4ea4\uff0c\u672a\u5728\u961f\u5217",
+    "5": "\u5df2\u64a4\u5355",
+    "a": "\u672a\u77e5",
+    "b": "\u5c1a\u672a\u89e6\u53d1",
+    "c": "\u5df2\u89e6\u53d1",
+}
+
+def _fix_cn(txt):
+    """修复 CTP GBK 中文经错误解码产生的 mojibake；无法修复则原样返回。"""
+    if not txt:
+        return ""
+    try:
+        return txt.encode("latin-1").decode("gbk")
+    except Exception:  # noqa: BLE001
+        return txt
+
+
+def _order_total(p):
+    """委托总量：QryOrder 回报里 VolumeTotal 可能为 0，VolumeTotalOriginal 才是原始委托量。"""
+    for nm in ("VolumeTotalOriginal", "VolumeTotal"):
+        try:
+            v = int(float(getattr(p, nm, 0) or 0))
+            if v > 0:
+                return v
+        except Exception:  # noqa: BLE001
+            pass
+    return 0
+
+
+def _status_label(p):
+    code = str(getattr(p, "OrderStatus", "") or "").strip()
+    # 部分柜台/绑定把 GBK 字节在解码阶段就变成 U+FFFD，StatusMsg 无法还原；
+    # 状态码是权威字段，直接以状态码映射中文，只有未知码才回退修复后的原文。
+    label = _STATUS_FIX.get(code)
+    if label:
+        return code, label
+    msg = _fix_cn(str(getattr(p, "StatusMsg", "") or ""))
+    if msg and "\ufffd" not in msg and msg.isascii() is False:
+        return code, msg
+    return code, (msg or code or "")
+
+
 class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
     """交易 SPI 回调（模块级类，CTP 工作线程驱动）。"""
 
@@ -181,6 +250,11 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         self.state = state
         self.action = action              # query / order / cancel / instruments
         self.order = order or {}
+        self._main_board_wanted = {
+            (str(x.get("product", "")).upper(), str(x.get("exchange", "")).upper())
+            for x in (self.order.get("products") or [])
+            if x.get("product")
+        } if self.action == "main_board" else set()
         self._rid = 100
         self._order_ref = ""
         self._settled_fired = False
@@ -267,7 +341,7 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
                 _log(f"depth query submit error: {type(e).__name__}: {e}")
                 self.state["depth_done"] = True
             return
-        if self.action in ("instruments", "main_contract"):
+        if self.action in ("instruments", "main_contract", "main_board"):
             try:
                 self._do_query_instruments()
             except Exception as e:  # noqa: BLE001
@@ -564,11 +638,11 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
                     "instrument_id": str(getattr(p, "InstrumentID", "") or ""),
                     "exchange_id": str(getattr(p, "ExchangeID", "") or ""),
                     "status": str(getattr(p, "OrderStatus", "") or ""),
-                    "status_msg": str(getattr(p, "StatusMsg", "") or ""),
+                    "status_msg": _status_label(p)[1],
                     "direction": str(getattr(p, "Direction", "") or ""),
                     "offset_flag": str(getattr(p, "CombOffsetFlag", "") or ""),
                     "limit_price": _num(p, "LimitPrice"),
-                    "volume_total": int(float(getattr(p, "VolumeTotal", 0) or 0)),
+                    "volume_total": _order_total(p),
                     "volume_traded": int(float(getattr(p, "VolumeTraded", 0) or 0)),
                     "insert_time": str(getattr(p, "InsertTime", "") or ""),
                 }
@@ -603,6 +677,7 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
 
     def _do_query_instruments(self):
         # 按品种前缀查合约。order 里传 product（如 "IC"）/exchange（如 "CFFEX"）。
+        # main_board 一次拉全市场合约，再在回调里按常用品种过滤。
         f = T.CThostFtdcQryInstrumentField()
         prod = str(self.order.get("product", "")).strip()
         exch = str(self.order.get("exchange_id", "")).strip()
@@ -616,7 +691,7 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
 
     def OnRspQryInstrument(self, p, info, n, last):
         # 持仓均价换算路径：只取合约乘数，不写入 instruments 列表
-        if self.action not in ("instruments", "main_contract"):
+        if self.action not in ("instruments", "main_contract", "main_board"):
             if p is not None:
                 iid = str(getattr(p, "InstrumentID", "") or "")
                 if iid:
@@ -632,17 +707,19 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             try:
                 prod = str(self.order.get("product", "")).strip().upper()
                 iid = str(getattr(p, "InstrumentID", "") or "")
-                base = iid
+                exchange_id = str(getattr(p, "ExchangeID", "") or "")
                 # 只保留字母前缀匹配 product 的合约（如 IC 开头）
                 import re as _re
                 m = _re.match(r"^([A-Za-z]+)([0-9]+)$", iid)
                 ok = True
                 if prod:
                     ok = bool(m) and m.group(1).upper() == prod
+                if self.action == "main_board":
+                    ok = bool(m) and (m.group(1).upper(), exchange_id.upper()) in self._main_board_wanted
                 if ok and iid:
                     self.state["instruments"].append({
                         "instrument_id": iid,
-                        "exchange_id": str(getattr(p, "ExchangeID", "") or ""),
+                        "exchange_id": exchange_id,
                         "product_id": str(getattr(p, "ProductID", "") or ""),
                         "name": str(getattr(p, "InstrumentName", "") or ""),
                         "volume_multiple": int(float(getattr(p, "VolumeMultiple", 0) or 0)),
@@ -661,6 +738,12 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
                     self._do_query_market_data()
                 except Exception as e:  # noqa: BLE001
                     _log(f"market data query submit error: {type(e).__name__}: {e}")
+                    self._md_done = True
+            elif self.action == "main_board":
+                try:
+                    self._do_query_market_board()
+                except Exception as e:  # noqa: BLE001
+                    _log(f"market board query submit error: {type(e).__name__}: {e}")
                     self._md_done = True
 
     def _do_depth_one(self):
@@ -682,6 +765,15 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         self.state["_md_queue"] = list(tradable)
         self.state["market"] = {}
         _log(f"query depth market data one-by-one for {len(tradable)} instruments")
+        self._query_next_market()
+
+    def _do_query_market_board(self):
+        # 主力看板只登录一次：合约只收目标品种，行情也只查这些目标合约。
+        # 不使用空 InstrumentID 全市场快照，避免数千回调拖慢前端。
+        targets = [x["instrument_id"] for x in self.state.get("instruments", []) if x.get("is_trading")]
+        self.state["_md_queue"] = list(targets)
+        self.state["market"] = {}
+        _log(f"query target market data for {len(targets)} instruments")
         self._query_next_market()
 
     def _query_next_market(self):
@@ -722,9 +814,12 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             except Exception as e:  # noqa: BLE001
                 _log(f"depth market parse fail: {type(e).__name__}: {e}")
         if last:
-            # 查询流控：串行查下一合约前稍作等待（worker 独立进程，短暂阻塞回调线程可接受）
-            time.sleep(0.8)
-            self._query_next_market()
+            if self.action == "main_board":
+                self._md_done = True
+            else:
+                # 查询流控：串行查下一合约前稍作等待（worker 独立进程，短暂阻塞回调线程可接受）
+                time.sleep(0.8)
+                self._query_next_market()
 
     def _rsp_info(self, info):
         if info is None:
@@ -758,12 +853,12 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
                 "order_ref": ref,
                 "order_sys_id": str(getattr(p, "OrderSysID", "") or "").strip(),
                 "status": status,
-                "status_msg": str(getattr(p, "StatusMsg", "") or ""),
+                "status_msg": _fix_cn(str(getattr(p, "StatusMsg", "") or "")) or _STATUS_FIX.get(str(getattr(p,"OrderStatus","") or ""), str(getattr(p,"OrderStatus","") or "")),
                 "instrument_id": str(getattr(p, "InstrumentID", "") or ""),
                 "exchange_id": str(getattr(p, "ExchangeID", "") or ""),
                 "front_id": int(getattr(p, "FrontID", 0) or 0),
                 "session_id": int(getattr(p, "SessionID", 0) or 0),
-                "volume_total": int(float(getattr(p, "VolumeTotal", 0) or 0)),
+                "volume_total": _order_total(p),
                 "volume_traded": int(float(getattr(p, "VolumeTraded", 0) or 0)),
                 "limit_price": _num(p, "LimitPrice"),
             }
@@ -904,7 +999,7 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0,
         elif action == "instruments":
             if spi._instr_done:
                 break
-        elif action == "main_contract":
+        elif action in ("main_contract", "main_board"):
             if spi._md_done:
                 break
         else:
@@ -934,9 +1029,9 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0,
         "positions": state["positions"],
         "front_id": state["front_id"], "session_id": state["session_id"],
     }
-    if action == "main_contract":
-        insts = state.get("instruments", [])
-        market = state.get("market", {})
+    market = state.get("market", {})
+
+    def _attach_quotes(insts):
         for x in insts:
             q = market.get(x["instrument_id"]) or {}
             x.update({"open_interest": q.get("open_interest", 0),
@@ -944,19 +1039,57 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0,
                       "last_price": q.get("last_price"),
                       "upper_limit": q.get("upper_limit"),
                       "lower_limit": q.get("lower_limit")})
+        return insts
+
+    def _pick_main(insts):
         tradable = [x for x in insts if x.get("is_trading")] or insts
         with_oi = [x for x in tradable if x.get("open_interest")]
-        # 主力 = 持仓量最大；行情缺失时回退近月
         if with_oi:
-            main = max(with_oi, key=lambda x: x["open_interest"])
-        else:
-            main = sorted(tradable, key=lambda x: (x.get("expire_date") or "99999999"))[0] if tradable else None
+            return max(with_oi, key=lambda x: x["open_interest"]), "open_interest"
+        fallback = sorted(tradable, key=lambda x: (x.get("expire_date") or "99999999"))
+        return (fallback[0] if fallback else None), "nearest_expiry_fallback"
+
+    if action == "main_board":
+        insts = _attach_quotes(state.get("instruments", []))
+        groups = {}
+        for x in insts:
+            import re as _re
+            m = _re.match(r"^([A-Za-z]+)([0-9]+)$", x.get("instrument_id", ""))
+            if m:
+                groups.setdefault((m.group(1).upper(), x.get("exchange_id", "")), []).append(x)
+        contracts, failed = [], []
+        for wanted in order.get("products") or []:
+            product = str(wanted.get("product", "")).upper()
+            exchange = str(wanted.get("exchange", "")).upper()
+            main, main_by = _pick_main(groups.get((product, exchange), []))
+            if main:
+                contracts.append({
+                    "product": product, "exchange": exchange,
+                    "instrument_id": main.get("instrument_id"),
+                    "open_interest": main.get("open_interest"),
+                    "volume": main.get("volume"),
+                    "last_price": main.get("last_price"),
+                    "upper_limit": main.get("upper_limit"),
+                    "lower_limit": main.get("lower_limit"),
+                    "main_by": main_by,
+                })
+            else:
+                failed.append({"product": product, "exchange": exchange, "error": "no tradable contract"})
+        out.update({"status": "main_board", "contracts": contracts, "failed": failed,
+                    "main_by": "open_interest" if contracts else "nearest_expiry_fallback"})
+        out["ok"] = bool(contracts)
+        return out
+
+    if action == "main_contract":
+        insts = _attach_quotes(state.get("instruments", []))
+        tradable = [x for x in insts if x.get("is_trading")] or insts
+        main, main_by = _pick_main(insts)
         front = sorted(tradable, key=lambda x: (x.get("expire_date") or "99999999"))
         out["instruments"] = insts
         out["tradable_count"] = len(tradable)
         out["main_contract"] = main
         out["front_contract"] = front[0] if front else None
-        out["main_by"] = "open_interest" if with_oi else "nearest_expiry_fallback"
+        out["main_by"] = main_by
         out["status"] = "main_contract"
         out["ok"] = bool(main)
         return out
@@ -1010,11 +1143,12 @@ if __name__ == "__main__":
         except Exception as e:  # noqa: BLE001
             print("RESULT_JSON=" + json.dumps(
                 {"ok": False, "status": "bad_order_json", "error": str(e)},
-                ensure_ascii=False), flush=True)
+                ensure_ascii=True), flush=True)
             sys.exit(2)
     try:
-        result = run(action=_action, order=_order)
+        _timeout = float(os.environ.get("CTP_TIMEOUT", "30") or "30")
+        result = run(action=_action, order=_order, timeout=_timeout)
     except Exception as e:  # noqa: BLE001  # 兜底（原生崩溃不走这里）
         result = {"ok": False, "status": "crash_py", "error": f"{type(e).__name__}: {e}"}
-    print("RESULT_JSON=" + json.dumps(result, ensure_ascii=False), flush=True)
+    print("RESULT_JSON=" + json.dumps(result, ensure_ascii=True), flush=True)
     sys.exit(0 if result.get("ok") else 2)

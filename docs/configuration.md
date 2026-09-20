@@ -69,53 +69,60 @@ okx:
 
 **项目路径**: `C:/projects/trading`
 
+**Python 路径**: `C:\Users\wang\AppData\Local\Programs\Python\Python312\python.exe`（不在系统 PATH）
+
 **启动 Webhook**:
+
 ```bash
-# SSH 登录后进入项目目录
-cd C:/projects/trading
-
-# 启动 webhook（后台运行）
-start /B cmd /c "python notify\webhook_bridge.py > webhook.log 2>&1"
-
-# 或使用 PowerShell
-Start-Process -FilePath python -ArgumentList C:\projects\trading\notify\webhook_bridge.py -WorkingDirectory C:\projects\trading -WindowStyle Hidden
+# 必须用完整 Python 路径
+C:\Users\wang\AppData\Local\Programs\Python\Python312\python.exe C:\projects\trading\notify\webhook_bridge.py
+# 后台: start /B cmd /c "..."
 ```
+
+**自愈脚本**: `C:\projects\trading\health_check.bat`
+- 每 5 分钟由 Windows Task Scheduler `TradingHealthCheck` 触发
+- 执行 `scripts/smoke_test.py`，失败 3 次后自动 `taskkill /F /IM python.exe` 并重启
+
+**烟雾测试**:
+```bash
+C:\Users\wang\AppData\Local\Programs\Python\Python312\python.exe C:\projects\trading\scripts\smoke_test.py
+```
+测试 4 项: `/health`, `/health/full`, `POST /api/signals`, `GET /api/signals/<id>`
 
 **检查状态**:
 ```bash
-# 查看 webhook 是否运行
+# Flask 端口
 netstat -ano | findstr 5002
 
-# 查看日志
-powershell -Command "Get-Content C:\projects\trading\webhook.log"
+# 日志尾部
+powershell -Command "Get-Content C:\projects\trading\webhook.log -Tail 20"
+
+# 计划任务
+schtasks /query /tn TradingHealthCheck
 ```
 
-**重启步骤**:
+**部署新文件（scp 直传）**:
 ```bash
-# 1. 登录服务器
-ssh wang@100.99.204.126
-
-# 2. 拉取最新代码
-cd C:/projects/trading
-git pull
-
-# 3. 删除旧的 okx.yaml（如果存在）
-del config\okx.yaml
-
-# 4. 停止旧进程
-taskkill //F //IM python.exe
-
-# 5. 重启 webhook
-start /B cmd /c "python notify\webhook_bridge.py > webhook.log 2>&1"
+# macOS → winclaw（因为 GitHub 在 winclaw 上被墙）
+scp <local_file> wang@100.99.204.126:/tmp/trading_new/
+ssh wang@100.99.204.126 "copy /Y C:\tmp\trading_new\<file> C:\projects\trading\<dest>"
 ```
 
-**远程执行命令**:
-```bash
-# 从本地执行远程命令
-ssh wang@100.99.204.126 "cd C:/projects/trading && git pull"
-ssh wang@100.99.204.126 "taskkill //F //IM python.exe"
-ssh wang@100.99.204.126 'start /B cmd /c "python notify\webhook_bridge.py"'
-```
+### quant-core (100.99.204.126:8005)
+
+另一台服务器，FastAPI 数据服务。TDX/IB/OKX/TV 多源行情。
+
+## Webhook 端点
+
+| 方法 | 路径 | 用途 |
+|------|------|------|
+| GET | `/health` | 5组件自检 (feishu/risk_gate/signal_api/order_manager/query_only) |
+| GET | `/health/full` | 深度自检 (含 IB 连接状态) |
+| POST | `/tv-webhook` | TradingView 警报 |
+| POST | `/feishu-webhook` | 飞书命令+自然语言下单 |
+| POST | `/api/signals` | Agent 提交交易信号 |
+| POST | `/api/signals/<id>/confirm` | 人确认/拒绝信号 |
+| GET | `/api/signals/<id>` | 查询信号状态 |
 
 ## 注意事项
 
@@ -145,10 +152,8 @@ git push
 ## Webhook 测试
 
 ```bash
-# 本地测试
-curl -X POST http://127.0.0.1:5002/tv-webhook \
-  -H "Content-Type: application/json" \
-  -d '{"text": "status"}'
+# ❌ 本地测试已禁用（无数据环节）
+# 仅支持服务器测试
 
 # 服务器测试
 curl -X POST http://alerts.qiaoge.top/tv-webhook \
@@ -157,3 +162,66 @@ curl -X POST http://alerts.qiaoge.top/tv-webhook \
 ```
 
 支持的命令：`status`、`订单`、`持仓`、`账户`、`买入 DOGE-USDT 1` 等。
+
+---
+
+## SimNow 内盘期货配置
+
+### secrets.toml
+
+```toml
+SIMNOW_SIM_USER = "misyinhu"
+SIMNOW_SIM_PASSWORD = "你的SimNow密码"   # 需登录 SimNow 官网填写
+```
+
+### settings.yaml（simnow 段）
+
+```yaml
+simnow:
+  flag: sim          # sim / live（live 需另配服务器地址）
+  sim:
+    md_server: tcp://218.80.240.6:20002
+    td_server: tcp://218.80.240.6:20003
+    broker_id: "9999"
+    auth_code: "0000000000"
+  live:
+    md_server: tcp://180.168.146.187:10111
+    td_server: tcp://180.168.146.187:10112
+    broker_id: "9999"
+    auth_code: "0000000000"
+```
+
+### 配置读取
+
+```python
+from kanban.src.config import (
+    get_simnow_flag,          # "sim" / "live"
+    get_simnow_md_server,
+    get_simnow_td_server,
+    get_simnow_broker_id,
+    get_simnow_auth_code,
+    get_simnow_user,
+    get_simnow_password,
+)
+```
+
+### CTP DLL（必须）
+
+SimNow 需要从官网下载 CTP API DLL，放到以下任一目录：
+
+- `C:\Users\wang\AppData\Local\Programs\Python\Python313\`
+- `C:\projects\trading\`
+- Python 根目录（`C:\Users\wang\AppData\Local\Programs\Python\Python313\`）
+
+需要两个文件：
+- `mduserapi.dll`（行情）
+- `tradeuserapi.dll`（交易）
+
+下载地址：`https://www.simnow.com.cn/` → 技术支持 → CTP API
+
+### 连通性测试
+
+```bash
+ssh wang@100.99.204.126
+C:\Users\wang\AppData\Local\Programs\Python\Python313\python.exe C:\projects\trading\scripts\test_simnow.py
+```

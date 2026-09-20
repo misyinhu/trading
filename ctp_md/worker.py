@@ -71,33 +71,28 @@ class _ProfileWorker:
         return conn
 
     def _run_forever(self) -> None:
+        # MdApi 进程内只允许创建一次：同进程第二次 CreateFtdcMdApi（即使旧实例
+        # 不 Release）会触发原生 abort（2026-09-18 simnow 实测：前置夜盘快速
+        # 断开 → 旧逻辑 stop+new 重建 → <no Python frame> 原生崩溃，pm2 2800+ 次）。
+        # Init 成功后断线/掉登录全部交给 CTP 原生重连（OnFrontConnected→
+        # ReqUserLogin→resubscribe），worker 层只做状态镜像，不 stop、不重建。
         backoff = _RECONNECT_MIN
-        while not self._stop.is_set():
+        started_ok = False
+        while not self._stop.is_set() and not started_ok:
             try:
                 conn = self._new_connector()
                 self._connector = conn
                 conn.subscribe(list(self.subs.get(self.profile)))
                 conn.start()
-            except Exception as e:  # 绑定缺失/前置错误
+                started_ok = True
+            except Exception as e:  # 绑定缺失/构造失败：api 未创建，可安全重试
                 self._set_state("error", f"start failed: {e}")
-            # 监控循环：连接存活且已登录时等待；掉线后退避重连
-            while not self._stop.is_set():
-                time.sleep(1.0)
-                # idle=回放播完保活；只有真实掉线/错误才重连
-                if self.state in ("disconnected", "error"):
-                    break
-                # 心跳：logined 但长时间无 tick 不主动断（非交易时段无推送属正常）
-            try:
-                if self._connector is not None:
-                    self._connector.stop()
-            except Exception:
-                pass
-            self._set_state("disconnected", f"reconnect in {backoff:.0f}s")
-            self._stop.wait(backoff)
-            backoff = min(_RECONNECT_MAX, backoff * 2)
-            # 连上一次后重置退避
-            if self.state == "logined":
-                backoff = _RECONNECT_MIN
+                self._stop.wait(backoff)
+                backoff = min(_RECONNECT_MAX, backoff * 2)
+        # 常驻：仅心跳观察状态；logined 后无 tick（非交易时段）不主动断，
+        # disconnected/error 也不重建（等原生自动重连回调改回 logined）。
+        while not self._stop.is_set():
+            self._stop.wait(5.0)
 
     def _on_status(self, state: str, msg: str) -> None:
         self._set_state(state, msg)

@@ -21,7 +21,7 @@ pairs:
         ratio: 2
         local_symbol: "MYMH6"
 
-  - name: "HSTECH_MCH"
+  - name: "HSTECH_HSI"
     mode: "value"
     threshold: 10000
     oversold: -3
@@ -34,14 +34,14 @@ pairs:
         currency: "HKD"
         multiplier: 50
         ratio: 1
-        local_symbol: "HTIH6"
-      - symbol: "MCH.HK"
+        local_symbol: "HTIZ6"
+      - symbol: "HSI"
         exchange: "HKFE"
         sec_type: "FUT"
         currency: "HKD"
-        multiplier: 10
-        ratio: 3
-        local_symbol: "MCHH6"
+        multiplier: 50
+        ratio: -1
+        local_symbol: "HSIZ6"
 
   - name: "RB_CL"
     mode: "value"
