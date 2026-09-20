@@ -46,6 +46,13 @@ jobs:
               $global:LASTEXITCODE = 0
             }
           }
+          # live_gateway 非镜像同步（补传 time_stop.py 等；不用 /MIR，避免删掉机器上的本地备份目录）
+          if (Test-Path "$src\live_gateway") {
+            & robocopy "$src\live_gateway" "$dst\live_gateway" /E /NFL /NDL /NJH /NJS /NP /R:2 /W:3 `
+              /XD "__pycache__" /XF "*.pyc"
+            if ($LASTEXITCODE -ge 8) { throw "robocopy live_gateway failed ($LASTEXITCODE)" }
+            $global:LASTEXITCODE = 0
+          }
           Write-Host "Sync done."
 
       - name: Install python deps
