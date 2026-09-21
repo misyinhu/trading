@@ -229,10 +229,6 @@ class TimeStopWatcher:
             self.manual = {}
             for l in self.lots:
                 l["adopted"] = True  # lots from previous session are already tracked
-                # audit mode never sends real closes — acted flag cannot be trusted
-                # across restarts; always reset to avoid stale marks on live positions
-                if MODE != "enforce":
-                    l["acted"] = False
             for k, v in dict(d.get("manual", {})).items():
                 self.manual[k if ":" in k else f"ib:{k}"] = v
         except Exception:
