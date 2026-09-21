@@ -120,10 +120,16 @@ def structure_signals(bars: list[dict], open_dt: datetime, direction: int,
     if not bars:
         return None
     ou = open_dt.astimezone(timezone.utc)
+    def _bar_ts(b):
+        # IB formatDate=2 理论上给 epoch 秒，部分版本仍返回 datetime，统一归一化。
+        t = b["ts"]
+        if isinstance(t, datetime):
+            return t.astimezone(timezone.utc) if t.tzinfo else t.replace(tzinfo=timezone.utc)
+        return datetime.fromtimestamp(float(t), tz=timezone.utc)
     hi = [float(b["h"]) for b in bars]
     lo = [float(b["l"]) for b in bars]
     cl = [float(b["c"]) for b in bars]
-    ts = [datetime.fromtimestamp(float(b["ts"]), tz=timezone.utc) for b in bars]
+    ts = [_bar_ts(b) for b in bars]
     atr = sorted(hi[i] - lo[i] for i in range(max(0, len(bars) - ATR_WIN), len(bars)))
     if not atr or atr[len(atr) // 2] <= 0:
         return None
@@ -598,13 +604,51 @@ class TimeStopWatcher:
             self._audit("breakout_alert", {"root": l["root"], "vol_x": round(sig["vol_x"], 2),
                                             "pnl_usd": round(usd, 1)})
 
+    def _metrics_only(self, l: dict, now: datetime, age: float,
+                      bars_pack: dict | None) -> None:
+        """对冲腿专用：只计算并写入 UW/ER/MFE/GB，绝不通知、绝不动作。"""
+        market = l.get("market", "ib")
+        if market == "ctp":
+            if not self._ctp_bars_provider or not l.get("open_px"):
+                return
+            try:
+                bars_list = self._ctp_bars_provider(l["symbol"])
+            except Exception:  # noqa: BLE001
+                return
+            bars_pack = {"bars": bars_list, "mult": 1.0}
+        if not bars_pack or not l.get("open_px"):
+            return
+        sig = structure_signals(
+            bars_pack.get("bars", []), _parse_dt(l["clock_dt"]),
+            1 if l["dir"] == "long" else -1, now, l.get("open_px"))
+        if sig is None:
+            return
+        mult = float(bars_pack.get("mult") or 1.0)
+        usd = sig["pnl_a"] * sig["atr_px"] * abs(l["qty"]) * mult
+        l["metrics"] = {"mfe_a": round(sig["mfe_a"], 2), "pnl_a": round(sig["pnl_a"], 2),
+                        "uw": round(sig["uw"], 3), "er": round(sig["er"], 3),
+                        "giveback_a": round(sig["giveback_a"], 2),
+                        "atr_usd": round(sig["atr_px"] * abs(l["qty"]) * mult, 1),
+                        "pnl_usd": round(usd, 1), "breakout": sig["breakout"],
+                        "vol_x": round(sig["vol_x"], 2),
+                        "bars": sig["bars_since_open"],
+                        "ts": now.isoformat()}
+
     def _evaluate(self, now: datetime, can_trade: bool, bars: dict | None = None) -> None:
         for l in self.lots:
-            if l.get("hedged") or l.get("acted") or l["symbol"] in self.desync_alerted:
+            if l.get("acted") or l["symbol"] in self.desync_alerted:
                 continue
             market = l.get("market", "ib")
             age = (now - _parse_dt(l["clock_dt"])).total_seconds()
             tag = self._lot_tag(l)
+            # 对冲腿：照常计算并展示 UW/ER/MFE/GB（供观察），但跳过全部
+            # 告警与 2h/3h 平仓动作。
+            if l.get("hedged"):
+                if market == "ib":
+                    self._metrics_only(l, now, age, (bars or {}).get(l["root"]))
+                elif market == "ctp":
+                    self._metrics_only(l, now, age, None)
+                continue
             if market == "ib":
                 self._structure_alert(l, now, age, (bars or {}).get(l["root"]))
             elif market == "ctp":
