@@ -715,11 +715,14 @@ class TimeStopWatcher:
                         "bars": sig["bars_since_open"],
                         "ts": now.isoformat()}
 
-    def _evaluate(self, now: datetime, can_trade: bool, bars: dict | None = None) -> None:
+    def _evaluate(self, now: datetime, can_trade: bool, bars: dict | None = None,
+                  only_market: str | None = None) -> None:
         for l in self.lots:
             if l.get("acted") or l["symbol"] in self.desync_alerted:
                 continue
             market = l.get("market", "ib")
+            if only_market and market != only_market:
+                continue
             age = (now - _parse_dt(l["clock_dt"])).total_seconds()
             # 内盘交易时段短，时间止损（含提醒）不适用：CTP 一律只计算并
             # 展示 UW/ER/MFE/GB 供观察，绝不告警、绝不动作。
@@ -847,15 +850,31 @@ class TimeStopWatcher:
     def tick(self) -> None:
         try:
             now0 = _now()
+            # ── 1) CTP FIRST: fully independent of the flaky IB connection.
+            # A blocking/deadlocked IB snapshot must never starve the
+            # internal-feed metrics path.
+            ctp_positions = self._fetch_ctp()
+            now = _now()
+            if ctp_positions is not None:
+                with self._lock:
+                    self._sync_ctp(ctp_positions, now)
+                if MODE != "off":
+                    with self._lock:
+                        self._sample_ctp(ctp_positions)
+                    self._evaluate(now, False, None, only_market="ctp")
+                self._save()
+                self.last_tick = {"ts": now.isoformat(), "mode": MODE,
+                                  "open_lots": len(self.lots),
+                                  "seen_exec": len(self.seen_exec)}
+
+            # ── 2) IB LAST: snapshot may throw or block; CTP above is already
+            # done and persisted, so a hang here cannot hide internal alerts.
             roots = {l["root"] for l in self.lots
                      if l.get("market", "ib") == "ib"
                      and not l.get("hedged") and not l.get("acted")
                      and l["symbol"] not in self.desync_alerted}
             stale = {r for r in roots
                      if now0.timestamp() - self._bars.get(r, {}).get("ts", 0) > BARS_REFRESH_SEC}
-            # IB snapshot failure must NOT block the CTP path: the gateway
-            # connection is flaky (clientId/timeout), but the internal feed
-            # runs independently. Degrade IB data to empty on failure.
             try:
                 fills, positions, portfolio, fresh = self._snapshot(stale)
             except Exception as snap_err:  # noqa: BLE001
@@ -865,7 +884,6 @@ class TimeStopWatcher:
                 pack["ts"] = now0.timestamp()
                 self._bars[r] = pack
             self._bars = {r: p for r, p in self._bars.items() if r in roots}
-            ctp_positions = self._fetch_ctp()
             with self._lock:
                 for f in fills:
                     eid = str(f.get("exec_id"))
@@ -873,21 +891,15 @@ class TimeStopWatcher:
                         self.seen_exec.add(eid)
                         self._apply_fill(f)
                 now = _now()
-                if ctp_positions is not None:
-                    self._sync_ctp(ctp_positions, now)
                 self._refresh_hedge(now)
-                # _adopt_positions only for CTP: IB lots come from fills only.
-                # IB positions without fills (e.g. restart gap) are reconciled by
-                # the desync alert, not by creating phantom lots.
                 can_trade = self._reconcile(positions)
                 if MODE != "off":
                     self._sample_underwater(portfolio)
-                    if ctp_positions is not None:
-                        self._sample_ctp(ctp_positions)
-                    self._evaluate(now, can_trade, self._bars)
+                    self._evaluate(now, can_trade, self._bars, only_market="ib")
                 self._save()
                 self.last_tick = {"ts": now.isoformat(), "mode": MODE,
-                                  "open_lots": len(self.lots), "seen_exec": len(self.seen_exec)}
+                                  "open_lots": len(self.lots),
+                                  "seen_exec": len(self.seen_exec)}
         except Exception as e:  # noqa: BLE001
             self._audit("tick_error", {"error": str(e)})
 

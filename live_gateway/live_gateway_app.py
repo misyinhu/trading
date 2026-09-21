@@ -421,6 +421,23 @@ try:
     from live_gateway.time_stop import TimeStopWatcher  # type: ignore
 except ImportError:  # running as a single-file script from live_gateway/
     from time_stop import TimeStopWatcher  # type: ignore
+# CTP 5m bar aggregation feed: created and connected BEFORE the watcher
+# starts, so every tick has a ready feed (avoids import-order races).
+try:
+    from live_gateway.ctp_bars_feed import CtpBarsFeed
+except ImportError:
+    from ctp_bars_feed import CtpBarsFeed
+
+ctp_bars_feed = CtpBarsFeed()
+
+try:
+    from ctp_client.ctp_worker import _load_config
+    _feed_cfg = _load_config(CTP_PROFILE)
+except Exception:  # noqa: BLE001
+    _feed_cfg = None
+if _feed_cfg and _feed_cfg.get("md_server"):
+    ctp_bars_feed.start(_feed_cfg)
+
 time_stop = TimeStopWatcher(manager)
 
 # CTP live positions feed for the watcher: read-only. No closer is wired,
@@ -434,9 +451,19 @@ def _ctp_positions_for_watcher():
             return None
         positions = snap.get("positions") or []
         try:
+            if not getattr(ctp_bars_feed, "_started", False):
+                _proj_root = Path(__file__).resolve().parents[1]
+                if str(_proj_root) not in sys.path:
+                    sys.path.insert(0, str(_proj_root))
+                from ctp_client.ctp_worker import _load_config
+                lazy_cfg = _load_config(CTP_PROFILE)
+                if lazy_cfg and lazy_cfg.get("md_server"):
+                    ctp_bars_feed.start(lazy_cfg)
+                    time_stop._audit("ctp_feed_lazy_start",
+                                     {"root_list": [pp.get("symbol") for pp in positions]})
             ctp_bars_feed.set_targets(p.get("symbol") for p in positions)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as feed_err:  # noqa: BLE001
+            time_stop._audit("ctp_feed_lazy_failed", {"error": str(feed_err)[:200]})
         return positions
     except Exception:  # noqa: BLE001
         return None
@@ -446,27 +473,6 @@ time_stop.set_ctp_provider(_ctp_positions_for_watcher)
 time_stop.set_ctp_bars_provider(lambda sym: ctp_bars_feed.bars(sym))
 time_stop.start()
 
-# CTP 5m bar aggregation feed: one resident MdApi thread, only current
-# position symbols are subscribed. Read-only; never used for execution.
-try:
-    from live_gateway.ctp_bars_feed import CtpBarsFeed
-except ImportError:
-    from ctp_bars_feed import CtpBarsFeed
-
-ctp_bars_feed = CtpBarsFeed()
-
-
-def _start_ctp_bars_feed():
-    try:
-        from ctp_client.ctp_worker import _load_config
-        cfg = _load_config(CTP_PROFILE)
-    except Exception:  # noqa: BLE001
-        cfg = None
-    if cfg and cfg.get("md_server"):
-        ctp_bars_feed.start(cfg)
-
-
-_start_ctp_bars_feed()
 
 
 def _real_money_denied() -> str | None:
@@ -535,6 +541,17 @@ def ib_live_time_stop_status():
         return jsonify({"error": str(e)}), 503
 
 
+@app.post("/api/ib/live/time-stop/desync-clear")
+def ib_live_time_stop_desync_clear():
+    """清除指定品种的 desync 告警（人工核查持仓一致后调用）。
+    body: {"symbol": "GBP"}"""
+    body = request.get_json(force=True, silent=True) or {}
+    sym = str(body.get("symbol") or "").strip()
+    if not sym:
+        return jsonify({"error": "symbol required"}), 400
+    result = time_stop.clear_desync(sym)
+    return jsonify(result)
+
 @app.post("/api/ib/live/time-stop/tick")
 def ib_live_time_stop_tick():
     """Manual evaluation tick (useful for checks). Never places orders unless
@@ -581,6 +598,13 @@ def ctp_live_account():
     return jsonify({"account": snap.get("account"), "status": snap.get("status"),
                     "investor": snap.get("investor"), "trading_day": snap.get("trading_day"),
                     "profile": CTP_PROFILE, "label": snap.get("label", CTP_PROFILE)})
+
+
+@app.get("/api/ctp/feed-debug")
+def ctp_feed_debug():
+    out = ctp_bars_feed.stats()
+    out["bars_fu2611"] = ctp_bars_feed.bars("fu2611")[-3:]
+    return jsonify(out)
 
 
 @app.get("/api/ctp/positions")
