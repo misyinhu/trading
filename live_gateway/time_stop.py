@@ -641,18 +641,17 @@ class TimeStopWatcher:
             market = l.get("market", "ib")
             age = (now - _parse_dt(l["clock_dt"])).total_seconds()
             tag = self._lot_tag(l)
-            # 对冲腿：照常计算并展示 UW/ER/MFE/GB（供观察），但跳过全部
-            # 告警与 2h/3h 平仓动作。
+            # 内盘交易时段短，时间止损（含提醒）不适用：CTP 一律只计算并
+            # 展示 UW/ER/MFE/GB 供观察，绝不告警、绝不动作。
+            if market == "ctp":
+                self._metrics_only(l, now, age, None)
+                continue
+            # 外盘对冲腿：照常展示指标，但跳过全部告警与 2h/3h 平仓动作。
             if l.get("hedged"):
-                if market == "ib":
-                    self._metrics_only(l, now, age, (bars or {}).get(l["root"]))
-                elif market == "ctp":
-                    self._metrics_only(l, now, age, None)
+                self._metrics_only(l, now, age, (bars or {}).get(l["root"]))
                 continue
             if market == "ib":
                 self._structure_alert(l, now, age, (bars or {}).get(l["root"]))
-            elif market == "ctp":
-                self._structure_alert(l, now, age, None)
             if age >= STOP_SEC:
                 l["acted"] = True
                 mk = l.get("market", "ib").upper()
