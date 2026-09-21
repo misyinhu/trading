@@ -853,7 +853,14 @@ class TimeStopWatcher:
                      and l["symbol"] not in self.desync_alerted}
             stale = {r for r in roots
                      if now0.timestamp() - self._bars.get(r, {}).get("ts", 0) > BARS_REFRESH_SEC}
-            fills, positions, portfolio, fresh = self._snapshot(stale)
+            # IB snapshot failure must NOT block the CTP path: the gateway
+            # connection is flaky (clientId/timeout), but the internal feed
+            # runs independently. Degrade IB data to empty on failure.
+            try:
+                fills, positions, portfolio, fresh = self._snapshot(stale)
+            except Exception as snap_err:  # noqa: BLE001
+                self._audit("ib_snapshot_skip", {"error": str(snap_err)[:120]})
+                fills, positions, portfolio, fresh = [], [], {}, {}
             for r, pack in fresh.items():
                 pack["ts"] = now0.timestamp()
                 self._bars[r] = pack
