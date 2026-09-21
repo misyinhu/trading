@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_BARS_PER_SYM = int(os.environ.get("CTP_BARS_MAX", "600"))
+REMOVE_GRACE_SEC = float(os.environ.get("CTP_REMOVE_GRACE_SEC", "90"))
 
 
 def _floor_5m(epoch_ms: int) -> int:
@@ -36,6 +37,8 @@ class CtpBarsFeed:
     def __init__(self):
         self._lock = threading.RLock()
         self._targets: set[str] = set()
+        self._wanted: set[str] = set()
+        self._missing_since: dict[str, float] = {}
         self._cur: dict[str, dict] = {}          # sym -> 进行中 bar
         self._done: dict[str, deque] = {}        # sym -> 已收盘 bar deque
         self._conn = None
@@ -44,6 +47,8 @@ class CtpBarsFeed:
         self._last_tick_at = 0.0
         self._status = "idle"
         self._error = ""
+        self._tick_error = ""
+        self._push_count = 0
 
     # ── 生命周期 ──────────────────────────────────────────────────────────
     def start(self, cfg: dict):
@@ -97,23 +102,44 @@ class CtpBarsFeed:
 
     # ── 订阅管理（watcher 按持仓调用）────────────────────────────────────
     def set_targets(self, symbols) -> None:
+        """按当前持仓更新订阅。
+
+        持仓查询走柜台单交易连接，偶发返回空时不能立刻退订——否则 bar 桶被
+        反复清空重建，永远无法跨 5 分钟切桶。缺失品种进入宽限计时，连续缺失
+        超过 REMOVE_GRACE_SEC 才真正 UnSubscribe 并丢弃 bar。
+        """
         wanted = {str(s) for s in symbols if s}
+        now = time.time()
         with self._lock:
-            added = list(wanted - self._targets)
-            removed = self._targets - wanted
-            self._targets = set(wanted)
+            self._wanted = set(wanted)
             conn = self._conn
-            if conn is not None and added:
+
+            added = [s for s in wanted if s not in self._targets]
+            if added and conn is not None:
                 conn.subscribe(added)
-            if conn is not None and removed:
-                try:
-                    from ctp_connector import _norm_md_symbols
-                    conn._api.UnSubscribeMarketData(
-                        _norm_md_symbols(list(removed)), len(removed))
-                except Exception:  # noqa: BLE001
-                    pass
-            for s in removed:
+            self._targets.update(added)
+
+            for s in list(self._missing_since):
+                if s in wanted:
+                    self._missing_since.pop(s, None)
+
+            for s in list(self._targets - wanted):
+                since = self._missing_since.get(s)
+                if since is None:
+                    self._missing_since[s] = now
+                    continue
+                if now - since < REMOVE_GRACE_SEC:
+                    continue
+                if conn is not None:
+                    try:
+                        from ctp_connector import _norm_md_symbols
+                        conn._api.UnSubscribeMarketData(
+                            _norm_md_symbols([s]), 1)
+                    except Exception:  # noqa: BLE001
+                        pass
                 self._cur.pop(s, None)
+                self._targets.discard(s)
+                self._missing_since.pop(s, None)
 
     # ── tick → bar（O(1)）───────────────────────────────────────────────
     def _on_tick(self, p):
@@ -124,7 +150,8 @@ class CtpBarsFeed:
                 return
             # CTP tick 无直接毫秒时间戳字段，用本机墙钟（交易线程，足够准）
             now_ms = int(time.time() * 1000)
-        except Exception:  # noqa: BLE001
+        except Exception as tick_exc:  # noqa: BLE001
+            self._tick_error = str(tick_exc)
             return
 
         bucket = _floor_5m(now_ms)
@@ -144,6 +171,7 @@ class CtpBarsFeed:
                 bar["c"] = px
 
     def _push_done(self, sym: str, bar: dict):
+        self._push_count += 1
         dq = self._done.get(sym)
         if dq is None:
             dq = deque(maxlen=MAX_BARS_PER_SYM)
@@ -168,11 +196,19 @@ class CtpBarsFeed:
 
     def stats(self) -> dict:
         with self._lock:
+            now = time.time()
             return {
                 "status": (self._conn.status.value
                            if self._conn is not None else self._status),
+                "wanted": sorted(self._wanted),
                 "targets": sorted(self._targets),
+                "missing": {s: round(now - t, 1)
+                            for s, t in self._missing_since.items()},
                 "symbols_bars": {s: len(dq) for s, dq in self._done.items()},
                 "last_tick_at": self._last_tick_at or None,
+                "tick_error": self._tick_error or None,
+                "cur_keys": sorted(self._cur.keys()),
+                "done_keys": {k: len(v) for k, v in self._done.items()},
+                "push_count": self._push_count,
                 "error": self._error,
             }

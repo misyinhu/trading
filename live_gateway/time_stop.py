@@ -84,7 +84,9 @@ def root_symbol(sym: str) -> str:
     i = len(sym)
     while i and sym[i - 1].isdigit():
         i -= 1
-    if i and sym[i - 1] in "FGHJKMNQUVXZ":
+    # Month letter only exists when contract digits were present (MNQZ6->MNQ);
+    # a bare continuous symbol (MNQ, GBP) must keep its product-name tail.
+    if i < len(sym) and i and sym[i - 1] in "FGHJKMNQUVXZ":
         i -= 1
     return sym[:i]
 
@@ -229,6 +231,12 @@ class TimeStopWatcher:
             self.manual = {}
             for l in self.lots:
                 l["adopted"] = True  # lots from previous session are already tracked
+                if l.get("market", "ib") == "ctp":
+                    l["root"] = ctp_root(l["symbol"])
+                    l["grp"] = ctp_sector(l["root"])
+                else:
+                    l["root"] = root_symbol(l["symbol"])
+                    l["grp"] = sector(l["root"])
             for k, v in dict(d.get("manual", {})).items():
                 self.manual[k if ":" in k else f"ib:{k}"] = v
         except Exception:
@@ -877,9 +885,11 @@ class TimeStopWatcher:
                      if now0.timestamp() - self._bars.get(r, {}).get("ts", 0) > BARS_REFRESH_SEC}
             try:
                 fills, positions, portfolio, fresh = self._snapshot(stale)
+                snapshot_ok = True
             except Exception as snap_err:  # noqa: BLE001
                 self._audit("ib_snapshot_skip", {"error": str(snap_err)[:120]})
                 fills, positions, portfolio, fresh = [], [], {}, {}
+                snapshot_ok = False
             for r, pack in fresh.items():
                 pack["ts"] = now0.timestamp()
                 self._bars[r] = pack
@@ -892,7 +902,14 @@ class TimeStopWatcher:
                         self._apply_fill(f)
                 now = _now()
                 self._refresh_hedge(now)
-                can_trade = self._reconcile(positions)
+                if not snapshot_ok:
+                    # Snapshot failed: positions is NOT "flat", just unknown.
+                    # Skip reconcile/adopt so a transient connection error can
+                    # never delete lots that are still open at the counter.
+                    can_trade = False
+                else:
+                    self._adopt_positions(positions, portfolio, now)
+                    can_trade = self._reconcile(positions)
                 if MODE != "off":
                     self._sample_underwater(portfolio)
                     self._evaluate(now, can_trade, self._bars, only_market="ib")
