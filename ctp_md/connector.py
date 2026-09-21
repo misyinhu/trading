@@ -143,11 +143,15 @@ class LegacyCtpConnector(BaseConnector):
     def start(self) -> None:
         from ctp_client.ctp_connector import CtpConfig, CtpMdConnector
 
+        root = Path(__file__).resolve().parents[1]
+        flow_path = root / "data" / f"md_flow_{self.profile}"
+        flow_path.mkdir(parents=True, exist_ok=True)
         cfg = CtpConfig(
             md_server=self.front, td_server="", broker_id=self.broker_id,
             user_id=self.user, password=self.password,
             auth_code=self.auth_code or "0" * 16,
-            app_id=self.app_id or "simnow_client_test")
+            app_id=self.app_id or "simnow_client_test",
+            flow_path=str(flow_path))
         self._status("logining", f"connect {self.front}")
         self._conn = CtpMdConnector(cfg)
         self._conn.add_tick_handler(self._on_raw)

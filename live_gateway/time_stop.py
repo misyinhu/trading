@@ -32,6 +32,8 @@ STOP_SEC = int(os.environ.get("TIME_STOP_STOP_SEC", str(3 * 3600)))
 TICK_SEC = int(os.environ.get("TIME_STOP_TICK_SEC", "30"))
 UW_RED = float(os.environ.get("TIME_STOP_UW_RED", "0.75"))    # underwater-time ratio -> red
 UW_GREEN = float(os.environ.get("TIME_STOP_UW_GREEN", "0.25"))
+GB_RED = float(os.environ.get("TIME_STOP_GB_RED", "2.0"))  # giveback ATR -> red
+GB_YELLOW = float(os.environ.get("TIME_STOP_GB_YELLOW", "1.0"))  # giveback ATR -> yellow
 MODE = os.environ.get("TIME_STOP_MODE", "audit").strip().lower()
 STATE_PATH = Path(os.environ.get("TIME_STOP_STATE", "data/time_stop_state.json"))
 AUDIT_PATH = Path(os.environ.get("TIME_STOP_AUDIT", "data/time_stop_audit.jsonl"))
@@ -185,6 +187,7 @@ class TimeStopWatcher:
         self.manual: dict[str, str] = {}   # key "ib:ROOT"/"ctp:ROOT" -> true|false
         self._ctp_provider = None
         self._ctp_closer = None
+        self._ctp_bars_provider = None
         self._ctp_cache: tuple[float, list] | None = None
         self._bars: dict[str, dict] = {}   # root -> {"ts": epoch, "bars": [...], "mult": x}
         self._load()
@@ -198,6 +201,10 @@ class TimeStopWatcher:
         Enforce mode only; counter-verified reduce-only close. Must raise on
         failure so the lot keeps its 3h action pending."""
         self._ctp_closer = fn
+
+    def set_ctp_bars_provider(self, fn) -> None:
+        """fn(symbol) -> list of 5m bars [{ts epoch UTC,o,h,l,c}] or []."""
+        self._ctp_bars_provider = fn
 
     @staticmethod
     def _mkey(l: dict) -> str:
@@ -420,6 +427,7 @@ class TimeStopWatcher:
             if existing is None:
                 # CTP positions default to "hedge/exempt" until the human unchecks
                 od = str(p.get("open_date") or "")
+                avg_px = p.get("avg_price") or 0.0
                 try:  # yyyyMMdd Beijing date -> UTC 01:00 (day session proxy)
                     odt = (datetime(int(od[:4]), int(od[4:6]), int(od[6:8]), 1, 0,
                                     tzinfo=timezone.utc) if od else now)
@@ -430,7 +438,8 @@ class TimeStopWatcher:
                        "market": "ctp", "open_dt": odt.isoformat(),
                        "clock_dt": odt.isoformat(), "warned": False, "acted": False,
                        "uw": 0, "tot": 0, "last_pnl": None, "light": None,
-                       "manual_default": True, "exec": ["ctp-position"]}
+                       "manual_default": True, "exec": ["ctp-position"],
+                       "open_px": float(avg_px) if avg_px else None}
                 self.lots.append(lot)
                 if key not in self.manual:
                     self.manual[key] = "true"   # default checkbox ON
@@ -510,8 +519,18 @@ class TimeStopWatcher:
     # ── evaluation ───────────────────────────────────────────────
     def _structure_alert(self, l: dict, now: datetime, age: float,
                          bars_pack: dict | None) -> None:
-        """Notify-only range/breakout alerts (IB lots only). NEVER orders."""
-        if l.get("market", "ib") != "ib" or not bars_pack or not l.get("open_px"):
+        """Notify-only range/breakout alerts. NEVER orders.
+        bars_pack for IB; CTP uses its aggregated 5m bars via provider."""
+        market = l.get("market", "ib")
+        if market == "ctp":
+            if not self._ctp_bars_provider or not l.get("open_px"):
+                return
+            try:
+                bars_list = self._ctp_bars_provider(l["symbol"])
+            except Exception:  # noqa: BLE001
+                return
+            bars_pack = {"bars": bars_list, "mult": 1.0}
+        if not bars_pack or not l.get("open_px"):
             return
         sig = structure_signals(
             bars_pack.get("bars", []), _parse_dt(l["clock_dt"]),
@@ -542,6 +561,34 @@ class TimeStopWatcher:
                          f"and now ${usd:+.0f} underwater; trend may be leaving the box")
             self._audit("mfe120_alert", {"root": l["root"], "mfe_a": round(sig["mfe_a"], 2),
                                           "pnl_usd": round(usd, 1)})
+        # Giveback alert: fires once when peak profit has been given back by ≥ N ATR.
+        # gb_a = giveback_atr already stored in metrics; arm requires mfe_a ≥ 1 ATR.
+        gb = sig.get("giveback_a", 0.0) or 0.0
+        mfe_a = sig.get("mfe_a", 0.0) or 0.0
+        if (not l.get("gb_alerted")
+                and mfe_a >= 1.0          # trailing must be armed
+                and gb >= GB_RED):
+            l["gb_alerted"] = True
+            self._notify(
+                f"🔴 GIVEBACK {tag}: {mfe_a:.2f}ATR peak → "
+                f"given back {gb:.2f}ATR (≥{GB_RED:g}), now ${usd:+.0f}; "
+                f"peak profit evaporated - tighten stop or exit")
+            self._audit("gb_alert", {"root": l["root"],
+                                    "mfe_a": round(mfe_a, 2),
+                                    "giveback_a": round(gb, 2),
+                                    "pnl_usd": round(usd, 1)})
+        elif (not l.get("gb_yellow_alerted")
+               and mfe_a >= 1.0
+               and gb >= GB_YELLOW):
+            l["gb_yellow_alerted"] = True
+            self._notify(
+                f"🟡 GIVEBACK WARNING {tag}: {mfe_a:.2f}ATR peak → "
+                f"given back {gb:.2f}ATR (≥{GB_YELLOW:g}); now ${usd:+.0f}; "
+                f"watch the stop")
+            self._audit("gb_yellow", {"root": l["root"],
+                                       "mfe_a": round(mfe_a, 2),
+                                       "giveback_a": round(gb, 2),
+                                       "pnl_usd": round(usd, 1)})
         if (not l.get("break_alerted") and age >= BREAK_MIN_AGE_SEC
                 and sig["breakout"] and sig["vol_x"] >= BREAK_VOL_X and sig["pnl_a"] < 0):
             l["break_alerted"] = True
@@ -560,6 +607,8 @@ class TimeStopWatcher:
             tag = self._lot_tag(l)
             if market == "ib":
                 self._structure_alert(l, now, age, (bars or {}).get(l["root"]))
+            elif market == "ctp":
+                self._structure_alert(l, now, age, None)
             if age >= STOP_SEC:
                 l["acted"] = True
                 mk = l.get("market", "ib").upper()

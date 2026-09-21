@@ -432,13 +432,41 @@ def _ctp_positions_for_watcher():
         ok, snap = _ctp_worker("positions", timeout=30)
         if not ok:
             return None
-        return snap.get("positions") or []
+        positions = snap.get("positions") or []
+        try:
+            ctp_bars_feed.set_targets(p.get("symbol") for p in positions)
+        except Exception:  # noqa: BLE001
+            pass
+        return positions
     except Exception:  # noqa: BLE001
         return None
 
 
 time_stop.set_ctp_provider(_ctp_positions_for_watcher)
+time_stop.set_ctp_bars_provider(lambda sym: ctp_bars_feed.bars(sym))
 time_stop.start()
+
+# CTP 5m bar aggregation feed: one resident MdApi thread, only current
+# position symbols are subscribed. Read-only; never used for execution.
+try:
+    from live_gateway.ctp_bars_feed import CtpBarsFeed
+except ImportError:
+    from ctp_bars_feed import CtpBarsFeed
+
+ctp_bars_feed = CtpBarsFeed()
+
+
+def _start_ctp_bars_feed():
+    try:
+        from ctp_client.ctp_worker import _load_config
+        cfg = _load_config(CTP_PROFILE)
+    except Exception:  # noqa: BLE001
+        cfg = None
+    if cfg and cfg.get("md_server"):
+        ctp_bars_feed.start(cfg)
+
+
+_start_ctp_bars_feed()
 
 
 def _real_money_denied() -> str | None:

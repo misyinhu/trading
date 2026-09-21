@@ -116,11 +116,21 @@ class CtpConfig:
     auth_code: str = "0000000000000000"
     app_id: str = "simnow_client_test"
     product_info: str = "simnow_client"
+    flow_path: str = ""
 
 
 # ---------------------------------------------------------------------------
 # 懒加载辅助：在 CtpTdConnector/CtpMdConnector 实例化时调用，返回 SWIG 模块
 # ---------------------------------------------------------------------------
+
+def _norm_md_symbols(symbols):
+    """不同 SWIG 绑定对合约列表元素类型要求不同：
+    6.5.1cp 绑定要 str，6.7.11 绑定要 bytes；传错会在原生层 abort。"""
+    use_str = "6.5.1cp" in _CTP_SWG_PATH.lower().replace("-", "")
+    if use_str:
+        return [str(x).encode().decode() for x in symbols]
+    return [str(x).encode("utf-8") for x in symbols]
+
 
 def _require_ctp():
     """确保 CTP SWIG 可用，否则抛 RuntimeError。首次调用触发检查。"""
@@ -163,7 +173,7 @@ class CtpMdConnector:
         self._MdSpi_cls = CThostFtdcMdSpi
         self._MdLoginField_cls = MdLoginField
 
-        self._api = CThostFtdcMdApi.CreateFtdcMdApi("")
+        self._api = CThostFtdcMdApi.CreateFtdcMdApi(getattr(config, "flow_path", ""))
         self._spi = _MdSpi(self, config)
         self._api.RegisterSpi(self._spi)
         if getattr(config, "md_server", ""):
@@ -176,7 +186,7 @@ class CtpMdConnector:
         if new:
             self._instruments.update(new)
             if self._status == ConnectionStatus.LOGINED:
-                self._api.SubscribeMarketData(new)
+                self._api.SubscribeMarketData(_norm_md_symbols(new), len(new))
 
     def add_tick_handler(self, handler: Callable):
         self._tick_handlers.append(handler)
@@ -207,13 +217,23 @@ class _MdSpi(CThostFtdcMdSpi):
         self.cfg = cfg
 
     def OnFrontConnected(self):
+        print("callback front connected", flush=True)
         req = self.conn._MdLoginField_cls()
         req.BrokerID = self.cfg.broker_id
         req.UserID = self.cfg.user_id
         req.Password = self.cfg.password
-        self.conn._api.ReqUserLogin(req, 1)
+        print("send login", self.cfg.broker_id, self.cfg.user_id, flush=True)
+        rc = self.conn._api.ReqUserLogin(req, 1)
+        print("login requested rc", rc, flush=True)
 
     def OnRspUserLogin(self, pUserLogin, pRspInfo, nRequestID, bIsLast):
+        print("login response", pRspInfo.ErrorID if pRspInfo else None, getattr(pRspInfo, "ErrorMsg", ""), flush=True)
+        self.conn._status = ConnectionStatus.LOGINED
+        print("marked logined; subscribe without reading response fields", flush=True)
+        if self.conn._instruments:
+            rc = self.conn._api.SubscribeMarketData(_norm_md_symbols(self.conn._instruments), len(self.conn._instruments))
+            print("subscribe requested rc", rc, flush=True)
+        return
         if pRspInfo and pRspInfo.ErrorID != 0:
             self.conn._last_error = f"Md login failed: [{pRspInfo.ErrorID}] {pRspInfo.ErrorMsg}"
             self.conn._status = ConnectionStatus.ERROR
@@ -222,7 +242,7 @@ class _MdSpi(CThostFtdcMdSpi):
         self.conn._trading_day = pUserLogin.TradingDay
         self.conn._status = ConnectionStatus.LOGINED
         if self.conn._instruments:
-            self.conn._api.SubscribeMarketData(list(self.conn._instruments))
+            self.conn._api.SubscribeMarketData(_norm_md_symbols(self.conn._instruments), len(self.conn._instruments))
 
     def OnFrontDisConnected(self, reason: int):
         self.conn._last_error = f"Md disconnected: {reason}"
