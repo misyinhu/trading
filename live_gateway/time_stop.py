@@ -344,7 +344,7 @@ class TimeStopWatcher:
                 why = "manual override: not a hedge" if mv == "false" else "pair unlocked"
                 mk = "IB" if l.get('market','ib')=='ib' else "CTP"
                 dir_cn = "做多" if l['dir']=='long' else "做空"
-                self._notify(f"🔓 {mk} {l['root']} {dir_cn} {abs(l['qty']):g}：{why}；时间规则已生效，2h 警戒 / 3h 离场")
+                self._notify(f"[UNLOCK] {mk} {l['root']} {dir_cn} {abs(l['qty']):g}：{why}；时间规则已生效，2h 警戒 / 3h 离场")
             l["hedged"] = hedged
             l["auto_hedged"] = auto
             l["manual_default"] = bool(l.get("manual_default")) and mv == "true"
@@ -371,10 +371,10 @@ class TimeStopWatcher:
     @staticmethod
     def _light(ratio: float, pnl: float) -> str:
         if ratio >= UW_RED:
-            return "🔴"
+            return "[RED]"
         if ratio < UW_GREEN and pnl > 0:
-            return "🟢"
-        return "🟡"
+            return "[GREEN]"
+        return "[YELLOW]"
 
     def _sample_underwater(self, pnl_map: dict) -> None:
         """Each 30s tick is one sample; symbol-level unrealizedPNL is allocated
@@ -405,12 +405,12 @@ class TimeStopWatcher:
             light = self._light(ratio, lot_pnl)
             prev = l.get("light")
             l["light"] = light
-            if l.get("warned") and prev and prev != "🔴" and light == "🔴":
+            if l.get("warned") and prev and prev != "[RED]" and light == "[RED]":
                 age = (_now() - _parse_dt(l["clock_dt"])).total_seconds() / 3600
                 mk = "IB" if l.get('market','ib')=='ib' else "CTP"
                 dir_cn = "做多" if l['dir']=='long' else "做空"
                 self._notify(
-                    f"🔴 灯号转红：{mk} {l['root']} {dir_cn} {abs(l['qty']):g}，已持有 {age:.1f} 小时，"
+                    f"[RED] 灯号转红：{mk} {l['root']} {dir_cn} {abs(l['qty']):g}，已持有 {age:.1f} 小时，"
                     f"浮亏时间占比 {ratio*100:.0f}%，当前浮盈亏 {lot_pnl:+.0f}；注意 3 小时离场线")
                 self._audit("red_escalate", {"market": l.get("market", "ib"), "root": l["root"], "age_h": round(age, 2),
                                              "uw_ratio": round(ratio, 3),
@@ -473,6 +473,9 @@ class TimeStopWatcher:
                 existing["symbol"] = sym
                 existing["dir"] = "long" if qty > 0 else "short"
                 existing["manual_default"] = self.manual.get(key) == "true"
+                avg_px = p.get("avg_price") or 0.0
+                if not existing.get("open_px") and avg_px:
+                    existing["open_px"] = float(avg_px)
         gone = [l for l in self.lots if l.get("market") == "ctp" and l["root"] not in seen]
         for l in gone:
             self.manual.pop(f"ctp:{l['root']}", None)
@@ -552,7 +555,7 @@ class TimeStopWatcher:
                         {"symbol": sym, "root": rt, "qty": pos,
                          "sec_type": sec_type, "market_price": info.get("market_price")})
             kind_txt = "外汇" if sec_type == "CASH" else (sec_type or "未知类型")
-            self._notify(f"📥 已接入存量持仓：{rt}（{kind_txt}）"
+            self._notify(f"[INFO] 已接入存量持仓：{rt}（{kind_txt}）"
                          f"{'做多' if pos > 0 else '做空'} {abs(pos):g}；"
                          "监控时长自现在起算（接入前真实持有时长未知），2h 警戒 / 3h 离场规则即刻生效")
 
@@ -577,19 +580,21 @@ class TimeStopWatcher:
                 continue
             if abs(net.get(sym, 0.0) - pnet.get(sym, 0.0)) > 1e-6:
                 if abs(pnet.get(sym, 0.0)) < 1e-9:
-                    # actually flat: lots were closed before gateway session
-                    # started or outside tracked fills; drop phantom lots
+                    # position is flat: close all lots for this symbol (close orders
+                    # may have been filled outside tracked fills, or position was
+                    # closed manually in IB)
                     roots = [self._mkey(l) for l in self.lots if l["symbol"] == sym]
                     self.lots = [l for l in self.lots if l["symbol"] != sym]
                     self.desync_alerted.discard(sym)
                     for k in roots:
                         self.manual.pop(k, None)
+                    self._notify(f"[INFO] 品种 {sym} 账户净持仓已归零，watcher 同步清除对应的持仓记录")
                     self._audit("reconcile_flat_clear", {"symbol": sym})
                     continue
                 ok = False
                 if sym not in self.desync_alerted:
                     self.desync_alerted.add(sym)
-                    self._notify(f"⚠️ 持仓数据不一致：品种 {sym}，watcher 记录净持仓 {net.get(sym,0):g}，"
+                    self._notify(f"[WARN] 持仓数据不一致：品种 {sym}，watcher 记录净持仓 {net.get(sym,0):g}，"
                                  f"账户实际净持仓 {pnet.get(sym,0):g}（差额 {pnet.get(sym,0)-net.get(sym,0):+g}）；"
                                  f"该品种时间止损已暂停，请人工核对后通过手动接口清除告警")
                     self._audit("desync", {"symbol": sym, "lot": net.get(sym, 0), "pos": pnet.get(sym, 0)})
@@ -633,13 +638,13 @@ class TimeStopWatcher:
         if (not l.get("mfe60_alerted") and age >= MFE_YELLOW_SEC
                 and sig["mfe_a"] < MFE_MIN_A):
             l["mfe60_alerted"] = True
-            self._notify(f"🟡 区间思路未兑现：{tag}；1 小时最大浮盈仅 {sig['mfe_a']:.2f}ATR"
+            self._notify(f"[WARN] 区间思路未兑现：{tag}；1 小时最大浮盈仅 {sig['mfe_a']:.2f}ATR"
                          f"（<{MFE_MIN_A}），区间交易没有带来收益，考虑评估离场")
             self._audit("mfe60_alert", {"root": l["root"], "mfe_a": round(sig["mfe_a"], 2)})
         if (not l.get("mfe120_alerted") and age >= MFE_RED_SEC
                 and sig["mfe_a"] < MFE_MIN_A and sig["pnl_a"] < 0):
             l["mfe120_alerted"] = True
-            self._notify(f"🔴 区间思路持续未兑现：{tag}；2 小时最大浮盈仅 {sig['mfe_a']:.2f}ATR，"
+            self._notify(f"[RED] 区间思路持续未兑现：{tag}；2 小时最大浮盈仅 {sig['mfe_a']:.2f}ATR，"
                          f"当前浮亏 ${usd:+.0f}；行情可能已走出区间")
             self._audit("mfe120_alert", {"root": l["root"], "mfe_a": round(sig["mfe_a"], 2),
                                           "pnl_usd": round(usd, 1)})
@@ -652,7 +657,7 @@ class TimeStopWatcher:
                 and gb >= GB_RED):
             l["gb_alerted"] = True
             self._notify(
-                f"🔴 盈利大幅回吐：{tag}；峰值浮盈 {mfe_a:.2f}ATR，"
+                f"[RED] 盈利大幅回吐：{tag}；峰值浮盈 {mfe_a:.2f}ATR，"
                 f"已回吐 {gb:.2f}ATR（≥{GB_RED:g}），当前 ${usd:+.0f}；"
                 f"峰值利润基本消失，应收紧止损或离场")
             self._audit("gb_alert", {"root": l["root"],
@@ -664,7 +669,7 @@ class TimeStopWatcher:
                and gb >= GB_YELLOW):
             l["gb_yellow_alerted"] = True
             self._notify(
-                f"🟡 盈利回吐预警：{tag}；峰值浮盈 {mfe_a:.2f}ATR，"
+                f"[WARN] 盈利回吐预警：{tag}；峰值浮盈 {mfe_a:.2f}ATR，"
                 f"已回吐 {gb:.2f}ATR（≥{GB_YELLOW:g}），当前 ${usd:+.0f}；"
                 f"请盯紧止损")
             self._audit("gb_yellow", {"root": l["root"],
@@ -674,7 +679,7 @@ class TimeStopWatcher:
         if (not l.get("break_alerted") and age >= BREAK_MIN_AGE_SEC
                 and sig["breakout"] and sig["vol_x"] >= BREAK_VOL_X and sig["pnl_a"] < 0):
             l["break_alerted"] = True
-            self._notify(f"🔴 区间被突破：{tag}；连续 3 根 5m 收在区间外"
+            self._notify(f"[RED] 区间被突破：{tag}；连续 3 根 5m 收在区间外"
                          f"（>{BREAK_MIN_A}ATR），放量 {sig['vol_x']:.1f} 倍，当前 ${usd:+.0f}；"
                          f"区间假设已失效，需要人工决策")
             self._audit("breakout_alert", {"root": l["root"], "vol_x": round(sig["vol_x"], 2),
@@ -731,24 +736,31 @@ class TimeStopWatcher:
                 dir_cn = "做多" if l["dir"] == "long" else "做空"
                 base = (f"IB {l['root']} {dir_cn} {abs(l['qty']):g}，已持有 {age/3600:.1f} 小时，"
                         f"触及 3 小时离场线；{self._cn_detail(l)}")
+                if not l.get("_3h_notified"):
+                    l["_3h_notified"] = True
                 if MODE == "enforce" and can_trade:
                     try:
                         res = self.mgr.order({"symbol": l["root"], "close_position": True,
                                               "quantity": abs(l["qty"])})
                         l["acted"] = True
-                        self._notify(f"✅ 已自动平仓：{base}；下单结果 {res.get('status')}")
+                        l["_3h_notified_sent"] = True
+                        self._notify(f"[OK] 已自动平仓：{base}；下单结果 {res.get('status')}")
                         self._audit("auto_close", {"market": market, "root": l["root"],
                                                    "symbol": l.get("symbol"), "dir": l["dir"],
                                                    "qty": abs(l["qty"]), "age_h": round(age/3600, 2),
                                                    "result": res})
                     except Exception as e:  # noqa: BLE001
                         l["acted"] = False
-                        self._notify(f"❌ 自动平仓失败：{base}；错误 {e}；将持续重试")
+                        self._notify(f"[FAIL] 自动平仓失败：{base}；错误 {e}；将持续重试")
                         self._audit("auto_close_failed", {"market": market, "root": l["root"],
                                                           "error": str(e)})
                 else:
                     enforce_txt = "当前为仅提醒模式，不会实际平仓" if MODE != "enforce" else "当前不可交易，已暂停自动平仓"
-                    self._notify(f"🔴 3 小时离场提醒：{base}；{enforce_txt}")
+                    if not l.get("_3h_notified_sent"):
+                        l["_3h_notified_sent"] = True
+                        self._notify(f"[AUDIT] 3 小时离场提醒：{base}；{enforce_txt}")
+                    else:
+                        self._notify(f"[AUDIT] 再次到达 3 小时离场线（watcher 已记录，将持续提醒直至平仓或解除）：{base}")
                     self._audit("would_close", {"root": l["root"], "dir": l["dir"],
                                                 "qty": abs(l["qty"]), "age_h": round(age/3600, 2),
                                                 "uw_ratio": round(l["uw"]/l["tot"], 3) if l.get("tot") else None,
@@ -763,7 +775,7 @@ class TimeStopWatcher:
                 else:
                     extra = "；5m 结构暂缺"
                 self._notify(
-                    f"🟠 2 小时警戒：IB {l['root']} {('做多' if l['dir']=='long' else '做空')} "
+                    f"[WARN] 2 小时警戒：IB {l['root']} {('做多' if l['dir']=='long' else '做空')} "
                     f"{abs(l['qty']):g}，已持有 {age/3600:.1f} 小时；3 小时为离场线{extra}。"
                     f"{self._cn_detail(l)}")
                 self._audit("warn", {"root": l["root"], "dir": l["dir"],
@@ -795,19 +807,8 @@ class TimeStopWatcher:
                                   "side": e.side, "shares": e.shares,
                                   "sec_type": c.secType, "price": e.price,
                                   "time": e.time.isoformat() if isinstance(e.time, datetime) else str(e.time)})
-            # current session fills
             for f in ib.fills():
                 _add_fill(f.execution, f.contract)
-            # historical executions (up to 7 days back for safety)
-            try:
-                from datetime import timedelta
-                req = ib.reqExecutions(
-                    ExecutionFilter(account=target,
-                                    time=(_now() - timedelta(days=7)).strftime("%Y%m%d %H:%M:%S")))
-                for exec_rep in (req or []):
-                    _add_fill(exec_rep.execution, exec_rep.contract)
-            except Exception as e:  # noqa: BLE001
-                self._audit("reqExecutions_failed", {"error": str(e)[:200]})
             for p in ib.positions():
                 if p.account != target:
                     continue
@@ -868,7 +869,9 @@ class TimeStopWatcher:
                 if ctp_positions is not None:
                     self._sync_ctp(ctp_positions, now)
                 self._refresh_hedge(now)
-                self._adopt_positions(positions, portfolio, now)
+                # _adopt_positions only for CTP: IB lots come from fills only.
+                # IB positions without fills (e.g. restart gap) are reconciled by
+                # the desync alert, not by creating phantom lots.
                 can_trade = self._reconcile(positions)
                 if MODE != "off":
                     self._sample_underwater(portfolio)
