@@ -51,6 +51,8 @@ BREAK_MIN_BARS = 10
 ATR_WIN = 20
 BOX_FORM_BARS = 6   # first 30min after open define the range box
 
+FX = {"GBP", "EUR", "JPY", "AUD", "CAD", "CHF", "NZD", "USD", "HKD",
+      "CNH", "SGD", "SEK", "NOK", "MXN", "ZAR"}
 INDEX = {"MNQ", "NQ", "MES", "ES", "MYM", "YM", "VXX", "VXZ"}
 METAL = {"MGC", "GC", "SI", "SIL"}
 COPPER = {"MHG", "HG"}
@@ -88,6 +90,8 @@ def root_symbol(sym: str) -> str:
 
 
 def sector(rt: str) -> str:
+    if rt in FX:
+        return "fx"
     if rt in INDEX or rt[:2] in ("VX", "VF", "VG", "VV"):
         return "index"
     if rt in METAL:
@@ -223,6 +227,12 @@ class TimeStopWatcher:
             self.lots = d.get("lots", [])
             self.seen_exec = set(d.get("seen_exec", []))
             self.manual = {}
+            for l in self.lots:
+                l["adopted"] = True  # lots from previous session are already tracked
+                # audit mode never sends real closes — acted flag cannot be trusted
+                # across restarts; always reset to avoid stale marks on live positions
+                if MODE != "enforce":
+                    l["acted"] = False
             for k, v in dict(d.get("manual", {})).items():
                 self.manual[k if ":" in k else f"ib:{k}"] = v
         except Exception:
@@ -261,8 +271,6 @@ class TimeStopWatcher:
 
     # ── fill → FIFO lot book (per precise symbol) ────────────────
     def _apply_fill(self, fill: dict) -> None:
-        if str(fill.get("sec_type", "")).upper() == "CASH":
-            return  # IDEALPRO forex conversion, not a directional position
         sym = fill["symbol"]
         rt = root_symbol(sym)
         q = float(fill.get("shares") or 0) * (1 if fill.get("side") == "BOT" else -1)
@@ -288,12 +296,21 @@ class TimeStopWatcher:
         if not bk:
             self.manual.pop(f"ib:{rt}", None)
         if abs(remaining) > 1e-9:
-            bk.append({"symbol": sym, "root": rt, "grp": sector(rt),
-                       "dir": "long" if remaining > 0 else "short",
-                       "qty": remaining, "open_dt": dt.isoformat(),
-                       "clock_dt": dt.isoformat(), "warned": False, "acted": False,
-                       "uw": 0, "tot": 0, "last_pnl": None, "light": None,
-                       "open_px": fill.get("price"), "exec": [exec_id]})
+            # Same-direction: accumulate into existing lot instead of creating
+            # a new lot. This handles repeated fills on the same side (e.g.
+            # two GBP buys) without inflating the lot count.
+            if bk:
+                existing = bk[0]
+                existing["qty"] += remaining
+                existing["exec"].append(exec_id)
+                # keep earliest open_dt as the true open time
+            else:
+                bk.append({"symbol": sym, "root": rt, "grp": sector(rt),
+                           "dir": "long" if remaining > 0 else "short",
+                           "qty": remaining, "open_dt": dt.isoformat(),
+                           "clock_dt": dt.isoformat(), "warned": False, "acted": False,
+                           "uw": 0, "tot": 0, "last_pnl": None, "light": None,
+                           "open_px": fill.get("price"), "exec": [exec_id]})
         self.lots = rest + list(bk)
 
     # ── hedge flag + unlock re-clock ─────────────────────────────
@@ -329,7 +346,9 @@ class TimeStopWatcher:
                 self._audit("unlock_reclock", {"symbol": l["symbol"], "root": l["root"],
                                                "dir": l["dir"], "cause": mv or "auto"})
                 why = "manual override: not a hedge" if mv == "false" else "pair unlocked"
-                self._notify(f"[{l.get('market','ib').upper()}] {why}; {l['dir']} {l['root']} timing rules active")
+                mk = "IB" if l.get('market','ib')=='ib' else "CTP"
+                dir_cn = "做多" if l['dir']=='long' else "做空"
+                self._notify(f"🔓 {mk} {l['root']} {dir_cn} {abs(l['qty']):g}：{why}；时间规则已生效，2h 警戒 / 3h 离场")
             l["hedged"] = hedged
             l["auto_hedged"] = auto
             l["manual_default"] = bool(l.get("manual_default")) and mv == "true"
@@ -392,9 +411,11 @@ class TimeStopWatcher:
             l["light"] = light
             if l.get("warned") and prev and prev != "🔴" and light == "🔴":
                 age = (_now() - _parse_dt(l["clock_dt"])).total_seconds() / 3600
+                mk = "IB" if l.get('market','ib')=='ib' else "CTP"
+                dir_cn = "做多" if l['dir']=='long' else "做空"
                 self._notify(
-                    f"[{l.get('market','ib').upper()}] {light} ESCALATE {l['dir']} {l['root']} {abs(l['qty']):g} aged {age:.1f}h | "
-                    f"underwater {ratio*100:.0f}% | floating {lot_pnl:+.0f} | hard exit at 3h")
+                    f"🔴 灯号转红：{mk} {l['root']} {dir_cn} {abs(l['qty']):g}，已持有 {age:.1f} 小时，"
+                    f"浮亏时间占比 {ratio*100:.0f}%，当前浮盈亏 {lot_pnl:+.0f}；注意 3 小时离场线")
                 self._audit("red_escalate", {"market": l.get("market", "ib"), "root": l["root"], "age_h": round(age, 2),
                                              "uw_ratio": round(ratio, 3),
                                              "floating": round(lot_pnl, 2)})
@@ -479,6 +500,22 @@ class TimeStopWatcher:
             ratio = l["uw"] / l["tot"] if l["tot"] else 0.0
             l["light"] = self._light(ratio, lot_pnl)  # score even while default-hedged
 
+    def _cn_detail(self, l: dict) -> str:
+        ratio = l["uw"] / l["tot"] if l.get("tot") else None
+        light = l.get("light") or ""
+        pnl = l.get("last_pnl")
+        if isinstance(pnl, (int, float)):
+            pnl_txt = f"当前浮盈 {pnl:+.0f}" if pnl >= 0 else f"当前浮亏 {pnl:+.0f}"
+        else:
+            pnl_txt = "浮盈亏暂缺"
+        if ratio is None:
+            uw_txt = "浮亏时间占比采样中"
+        else:
+            mins = l["tot"] * TICK_SEC / 60
+            span = f"{mins:.0f}分钟" if mins >= 1 else f"{l['tot']*TICK_SEC}秒"
+            uw_txt = f"浮亏时间占比 {ratio*100:.0f}%（{span}采样）"
+        return f"{light} {uw_txt}；{pnl_txt}".strip()
+
     def _lot_tag(self, l: dict) -> str:
         ratio = l["uw"] / l["tot"] if l.get("tot") else 0.0
         light = l.get("light") or "⚪"
@@ -488,6 +525,40 @@ class TimeStopWatcher:
         span = f"{mins:.0f}m" if mins >= 1 else f"{l['tot']*TICK_SEC}s"
         sample = f" | underwater {ratio*100:.0f}% over {span}" if l.get("tot") else ""
         return f"{light}{sample}{pnl_txt}"
+
+    def _adopt_positions(self, positions: list, portfolio: dict, now: datetime) -> None:
+        """接入监控启动前已持有、且无成交记录的仓位（如重启后仍持有的外汇）。
+        仅处理完全没有 lot 的品种；建一条存量 lot，计时从接入时刻起算。"""
+        self._adopted_this_tick: set[str] = set()
+        tracked = defaultdict(float)
+        for l in self.lots:
+            if l.get("market", "ib") == "ib":
+                tracked[l["symbol"]] += l["qty"]
+        for p in positions:
+            pos = float(p.get("position") or 0.0)
+            sym = str(p.get("symbol") or "")
+            if not sym or abs(pos) < 1e-9 or abs(tracked[sym]) > 1e-9:
+                continue
+            info = portfolio.get(sym) or {}
+            rt = root_symbol(sym)
+            sec_type = str(p.get("sec_type") or "")
+            lot = {"symbol": sym, "root": rt, "grp": sector(rt),
+                   "dir": "long" if pos > 0 else "short", "qty": pos,
+                   "market": "ib", "sec_type": sec_type,
+                   "open_dt": now.isoformat(), "clock_dt": now.isoformat(),
+                   "warned": False, "acted": False, "uw": 0, "tot": 0,
+                   "last_pnl": None, "light": None, "adopted": True,
+                   "open_px": info.get("market_price"), "exec": []}
+            self.lots.append(lot)
+            self._adopted_this_tick.add(sym)
+            self.desync_alerted.discard(sym)
+            self._audit("adopt_existing_position",
+                        {"symbol": sym, "root": rt, "qty": pos,
+                         "sec_type": sec_type, "market_price": info.get("market_price")})
+            kind_txt = "外汇" if sec_type == "CASH" else (sec_type or "未知类型")
+            self._notify(f"📥 已接入存量持仓：{rt}（{kind_txt}）"
+                         f"{'做多' if pos > 0 else '做空'} {abs(pos):g}；"
+                         "监控时长自现在起算（接入前真实持有时长未知），2h 警戒 / 3h 离场规则即刻生效")
 
     def _reconcile(self, positions: list[dict]) -> bool:
         """Compare net qty per symbol with positions. Return False if desync."""
@@ -501,7 +572,13 @@ class TimeStopWatcher:
             if p.get("position"):
                 pnet[p["symbol"]] += float(p["position"])
         ok = True
+        adopted = getattr(self, "_adopted_this_tick", set())
         for sym in set(net) | set(pnet):
+            # Skip symbols just adopted this tick; they are new to lots and may
+            # have been in the counter but not tracked before this session.
+            if sym in adopted:
+                self.desync_alerted.discard(sym)
+                continue
             if abs(net.get(sym, 0.0) - pnet.get(sym, 0.0)) > 1e-6:
                 if abs(pnet.get(sym, 0.0)) < 1e-9:
                     # actually flat: lots were closed before gateway session
@@ -516,7 +593,9 @@ class TimeStopWatcher:
                 ok = False
                 if sym not in self.desync_alerted:
                     self.desync_alerted.add(sym)
-                    self._notify(f"lot/position desync {sym}: lot={net.get(sym,0)} pos={pnet.get(sym,0)}; auto-stop suspended for symbol")
+                    self._notify(f"⚠️ 持仓数据不一致：品种 {sym}，watcher 记录净持仓 {net.get(sym,0):g}，"
+                                 f"账户实际净持仓 {pnet.get(sym,0):g}（差额 {pnet.get(sym,0)-net.get(sym,0):+g}）；"
+                                 f"该品种时间止损已暂停，请人工核对后通过手动接口清除告警")
                     self._audit("desync", {"symbol": sym, "lot": net.get(sym, 0), "pos": pnet.get(sym, 0)})
             elif sym in self.desync_alerted:
                 self.desync_alerted.discard(sym)
@@ -553,18 +632,19 @@ class TimeStopWatcher:
                         "vol_x": round(sig["vol_x"], 2),
                         "bars": sig["bars_since_open"],
                         "ts": now.isoformat()}
-        tag = f"{l['dir']} {l['root']} {abs(l['qty']):g} age {age/3600:.1f}h"
+        dir_cn0 = "做多" if l['dir']=='long' else "做空"
+        tag = f"{l['root']} {dir_cn0} {abs(l['qty']):g}，已持 {age/3600:.1f}h"
         if (not l.get("mfe60_alerted") and age >= MFE_YELLOW_SEC
                 and sig["mfe_a"] < MFE_MIN_A):
             l["mfe60_alerted"] = True
-            self._notify(f"🟡 RANGE-UNFILFILLED {tag}: 1h MFE {sig['mfe_a']:.2f}ATR "
-                         f"(<{MFE_MIN_A}); range idea not paying, review exit")
+            self._notify(f"🟡 区间思路未兑现：{tag}；1 小时最大浮盈仅 {sig['mfe_a']:.2f}ATR"
+                         f"（<{MFE_MIN_A}），区间交易没有带来收益，考虑评估离场")
             self._audit("mfe60_alert", {"root": l["root"], "mfe_a": round(sig["mfe_a"], 2)})
         if (not l.get("mfe120_alerted") and age >= MFE_RED_SEC
                 and sig["mfe_a"] < MFE_MIN_A and sig["pnl_a"] < 0):
             l["mfe120_alerted"] = True
-            self._notify(f"🔴 RANGE-STILL-UNFILFILLED {tag}: 2h MFE {sig['mfe_a']:.2f}ATR "
-                         f"and now ${usd:+.0f} underwater; trend may be leaving the box")
+            self._notify(f"🔴 区间思路持续未兑现：{tag}；2 小时最大浮盈仅 {sig['mfe_a']:.2f}ATR，"
+                         f"当前浮亏 ${usd:+.0f}；行情可能已走出区间")
             self._audit("mfe120_alert", {"root": l["root"], "mfe_a": round(sig["mfe_a"], 2),
                                           "pnl_usd": round(usd, 1)})
         # Giveback alert: fires once when peak profit has been given back by ≥ N ATR.
@@ -576,9 +656,9 @@ class TimeStopWatcher:
                 and gb >= GB_RED):
             l["gb_alerted"] = True
             self._notify(
-                f"🔴 GIVEBACK {tag}: {mfe_a:.2f}ATR peak → "
-                f"given back {gb:.2f}ATR (≥{GB_RED:g}), now ${usd:+.0f}; "
-                f"peak profit evaporated - tighten stop or exit")
+                f"🔴 盈利大幅回吐：{tag}；峰值浮盈 {mfe_a:.2f}ATR，"
+                f"已回吐 {gb:.2f}ATR（≥{GB_RED:g}），当前 ${usd:+.0f}；"
+                f"峰值利润基本消失，应收紧止损或离场")
             self._audit("gb_alert", {"root": l["root"],
                                     "mfe_a": round(mfe_a, 2),
                                     "giveback_a": round(gb, 2),
@@ -588,9 +668,9 @@ class TimeStopWatcher:
                and gb >= GB_YELLOW):
             l["gb_yellow_alerted"] = True
             self._notify(
-                f"🟡 GIVEBACK WARNING {tag}: {mfe_a:.2f}ATR peak → "
-                f"given back {gb:.2f}ATR (≥{GB_YELLOW:g}); now ${usd:+.0f}; "
-                f"watch the stop")
+                f"🟡 盈利回吐预警：{tag}；峰值浮盈 {mfe_a:.2f}ATR，"
+                f"已回吐 {gb:.2f}ATR（≥{GB_YELLOW:g}），当前 ${usd:+.0f}；"
+                f"请盯紧止损")
             self._audit("gb_yellow", {"root": l["root"],
                                        "mfe_a": round(mfe_a, 2),
                                        "giveback_a": round(gb, 2),
@@ -598,9 +678,9 @@ class TimeStopWatcher:
         if (not l.get("break_alerted") and age >= BREAK_MIN_AGE_SEC
                 and sig["breakout"] and sig["vol_x"] >= BREAK_VOL_X and sig["pnl_a"] < 0):
             l["break_alerted"] = True
-            self._notify(f"🔴 BREAKOUT {tag}: 3x5m closes beyond range edge "
-                         f"(>{BREAK_MIN_A}ATR), vol {sig['vol_x']:.1f}x, ${usd:+.0f}; "
-                         f"range assumption invalidated - manual decision")
+            self._notify(f"🔴 区间被突破：{tag}；连续 3 根 5m 收在区间外"
+                         f"（>{BREAK_MIN_A}ATR），放量 {sig['vol_x']:.1f} 倍，当前 ${usd:+.0f}；"
+                         f"区间假设已失效，需要人工决策")
             self._audit("breakout_alert", {"root": l["root"], "vol_x": round(sig["vol_x"], 2),
                                             "pnl_usd": round(usd, 1)})
 
@@ -640,7 +720,6 @@ class TimeStopWatcher:
                 continue
             market = l.get("market", "ib")
             age = (now - _parse_dt(l["clock_dt"])).total_seconds()
-            tag = self._lot_tag(l)
             # 内盘交易时段短，时间止损（含提醒）不适用：CTP 一律只计算并
             # 展示 UW/ER/MFE/GB 供观察，绝不告警、绝不动作。
             if market == "ctp":
@@ -653,30 +732,27 @@ class TimeStopWatcher:
             if market == "ib":
                 self._structure_alert(l, now, age, (bars or {}).get(l["root"]))
             if age >= STOP_SEC:
-                l["acted"] = True
-                mk = l.get("market", "ib").upper()
-                msg = (f"[{mk}] {l['dir']} {l['root']} {abs(l['qty']):g} aged {age/3600:.1f}h >= 3h {tag}")
+                dir_cn = "做多" if l["dir"] == "long" else "做空"
+                base = (f"IB {l['root']} {dir_cn} {abs(l['qty']):g}，已持有 {age/3600:.1f} 小时，"
+                        f"触及 3 小时离场线；{self._cn_detail(l)}")
                 if MODE == "enforce" and can_trade:
                     try:
-                        if market == "ctp":
-                            if not self._ctp_closer:
-                                raise RuntimeError("ctp closer not wired")
-                            res = self._ctp_closer(l["symbol"], l["dir"], abs(l["qty"]))
-                        else:
-                            res = self.mgr.order({"symbol": l["root"], "close_position": True,
-                                                  "quantity": abs(l["qty"])})
-                        self._notify(f"AUTO-CLOSE {msg} -> {res.get('status')}")
+                        res = self.mgr.order({"symbol": l["root"], "close_position": True,
+                                              "quantity": abs(l["qty"])})
+                        l["acted"] = True
+                        self._notify(f"✅ 已自动平仓：{base}；下单结果 {res.get('status')}")
                         self._audit("auto_close", {"market": market, "root": l["root"],
                                                    "symbol": l.get("symbol"), "dir": l["dir"],
                                                    "qty": abs(l["qty"]), "age_h": round(age/3600, 2),
                                                    "result": res})
                     except Exception as e:  # noqa: BLE001
                         l["acted"] = False
-                        self._notify(f"AUTO-CLOSE FAILED {msg}: {e}")
+                        self._notify(f"❌ 自动平仓失败：{base}；错误 {e}；将持续重试")
                         self._audit("auto_close_failed", {"market": market, "root": l["root"],
                                                           "error": str(e)})
                 else:
-                    self._notify(f"would close (dry run) {msg}")
+                    enforce_txt = "当前为仅提醒模式，不会实际平仓" if MODE != "enforce" else "当前不可交易，已暂停自动平仓"
+                    self._notify(f"🔴 3 小时离场提醒：{base}；{enforce_txt}")
                     self._audit("would_close", {"root": l["root"], "dir": l["dir"],
                                                 "qty": abs(l["qty"]), "age_h": round(age/3600, 2),
                                                 "uw_ratio": round(l["uw"]/l["tot"], 3) if l.get("tot") else None,
@@ -685,11 +761,15 @@ class TimeStopWatcher:
             elif age >= WARN_SEC and not l["warned"]:
                 l["warned"] = True
                 m = l.get("metrics") or {}
-                extra = (f"; MFE {m.get('mfe_a')}ATR now ${m.get('pnl_usd'):+,.0f}"
-                         if m else "; 5m structure n/a")
+                if m:
+                    extra = (f"；1h 最大浮盈 {m.get('mfe_a')}ATR，"
+                             f"当前浮动 ${m.get('pnl_usd'):+,.0f}")
+                else:
+                    extra = "；5m 结构暂缺"
                 self._notify(
-                    f"[{l.get('market','ib').upper()}] WARN {l['dir']} {l['root']} {abs(l['qty']):g} aged {age/3600:.1f}h >= 2h; "
-                    f"hard exit due at 3h{extra} {tag}")
+                    f"🟠 2 小时警戒：IB {l['root']} {('做多' if l['dir']=='long' else '做空')} "
+                    f"{abs(l['qty']):g}，已持有 {age/3600:.1f} 小时；3 小时为离场线{extra}。"
+                    f"{self._cn_detail(l)}")
                 self._audit("warn", {"root": l["root"], "dir": l["dir"],
                                      "age_h": round(age/3600, 2),
                                      "uw_ratio": round(l["uw"]/l["tot"], 3) if l.get("tot") else None,
@@ -704,18 +784,40 @@ class TimeStopWatcher:
             ib = self.mgr.start()
             target = self.mgr._target_account(ib)
             fills, positions, portfolio, bars_by_root = [], [], {}, {}
+            # ib.fills() only returns fills from the current session. Use
+            # reqExecutions to also pull historical fills (up to 7 days back),
+            # then deduplicate by execId using self.seen_exec.
+            seen_ids = self.seen_exec.copy()
+            def _add_fill(exec_, contract_):
+                e = exec_; c = contract_
+                eid = str(e.execId)
+                if eid and eid not in seen_ids:
+                    seen_ids.add(eid)
+                    if (e.acctNumber or "") and e.acctNumber != target:
+                        return
+                    fills.append({"exec_id": eid, "symbol": c.symbol,
+                                  "side": e.side, "shares": e.shares,
+                                  "sec_type": c.secType, "price": e.price,
+                                  "time": e.time.isoformat() if isinstance(e.time, datetime) else str(e.time)})
+            # current session fills
             for f in ib.fills():
-                e, c = f.execution, f.contract
-                if e.acctNumber and e.acctNumber != target:
-                    continue
-                fills.append({"exec_id": e.execId, "symbol": c.symbol,
-                              "side": e.side, "shares": e.shares, "sec_type": c.secType,
-                              "price": e.price,
-                              "time": e.time.isoformat() if isinstance(e.time, datetime) else str(e.time)})
+                _add_fill(f.execution, f.contract)
+            # historical executions (up to 7 days back for safety)
+            try:
+                from datetime import timedelta
+                req = ib.reqExecutions(
+                    ExecutionFilter(account=target,
+                                    time=(_now() - timedelta(days=7)).strftime("%Y%m%d %H:%M:%S")))
+                for exec_rep in (req or []):
+                    _add_fill(exec_rep.execution, exec_rep.contract)
+            except Exception as e:  # noqa: BLE001
+                self._audit("reqExecutions_failed", {"error": str(e)[:200]})
             for p in ib.positions():
                 if p.account != target:
                     continue
-                positions.append({"symbol": p.contract.symbol, "position": p.position})
+                positions.append({"symbol": p.contract.symbol,
+                                  "sec_type": p.contract.secType,
+                                  "position": p.position})
             # 5m bars for structure alerts (IB directional lots only); a
             # single contract failure is audited, never fatal to the tick.
             for p in ib.positions():
@@ -770,6 +872,7 @@ class TimeStopWatcher:
                 if ctp_positions is not None:
                     self._sync_ctp(ctp_positions, now)
                 self._refresh_hedge(now)
+                self._adopt_positions(positions, portfolio, now)
                 can_trade = self._reconcile(positions)
                 if MODE != "off":
                     self._sample_underwater(portfolio)
@@ -781,6 +884,19 @@ class TimeStopWatcher:
                                   "open_lots": len(self.lots), "seen_exec": len(self.seen_exec)}
         except Exception as e:  # noqa: BLE001
             self._audit("tick_error", {"error": str(e)})
+
+    def clear_desync(self, symbol: str) -> dict:
+        """Manually clear a desync alert after human verification.
+        Returns the updated desync list."""
+        with self._lock:
+            sym = str(symbol or "").strip()
+            if sym in self.desync_alerted:
+                self.desync_alerted.discard(sym)
+                self._save()
+                self._audit("desync_cleared_manual", {"symbol": sym})
+                return {"ok": True, "symbol": sym, "desync_symbols": sorted(self.desync_alerted)}
+            return {"ok": False, "symbol": sym, "reason": "not in desync list",
+                    "desync_symbols": sorted(self.desync_alerted)}
 
     def status(self) -> dict:
         now = _now()
