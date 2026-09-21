@@ -549,13 +549,17 @@ class TimeStopWatcher:
             info = portfolio.get(sym) or {}
             rt = root_symbol(sym)
             sec_type = str(p.get("sec_type") or "")
+            # IB futures' Position.avgCost is not a reliable unit price (may be
+            # a total/garbage value); leave open_px to the market-price aligned
+            # at open_dt inside structure_signals. Only trust a live market px.
+            open_px = info.get("market_price")
             lot = {"symbol": sym, "root": rt, "grp": sector(rt),
                    "dir": "long" if pos > 0 else "short", "qty": pos,
                    "market": "ib", "sec_type": sec_type,
                    "open_dt": now.isoformat(), "clock_dt": now.isoformat(),
                    "warned": False, "acted": False, "uw": 0, "tot": 0,
                    "last_pnl": None, "light": None, "adopted": True,
-                   "open_px": info.get("market_price"), "exec": []}
+                   "open_px": open_px, "exec": []}
             self.lots.append(lot)
             self._adopted_this_tick.add(sym)
             self.desync_alerted.discard(sym)
@@ -624,7 +628,7 @@ class TimeStopWatcher:
             except Exception:  # noqa: BLE001
                 return
             bars_pack = {"bars": bars_list, "mult": 1.0}
-        if not bars_pack or not l.get("open_px"):
+        if not bars_pack:
             return
         sig = structure_signals(
             bars_pack.get("bars", []), _parse_dt(l["clock_dt"]),
@@ -705,7 +709,7 @@ class TimeStopWatcher:
             except Exception:  # noqa: BLE001
                 return
             bars_pack = {"bars": bars_list, "mult": 1.0}
-        if not bars_pack or not l.get("open_px"):
+        if not bars_pack:
             return
         sig = structure_signals(
             bars_pack.get("bars", []), _parse_dt(l["clock_dt"]),
@@ -825,7 +829,8 @@ class TimeStopWatcher:
                     continue
                 positions.append({"symbol": p.contract.symbol,
                                   "sec_type": p.contract.secType,
-                                  "position": p.position})
+                                  "position": p.position,
+                                  "avgCost": p.avgCost})
             # 5m bars for structure alerts (IB directional lots only); a
             # single contract failure is audited, never fatal to the tick.
             for p in ib.positions():
@@ -877,9 +882,11 @@ class TimeStopWatcher:
 
             # ── 2) IB LAST: snapshot may throw or block; CTP above is already
             # done and persisted, so a hang here cannot hide internal alerts.
+            # Hedge legs are exempt from the 2h/3h actions but must still
+            # display ER/MFE/GB, so include them in the historical-bar pull.
             roots = {l["root"] for l in self.lots
                      if l.get("market", "ib") == "ib"
-                     and not l.get("hedged") and not l.get("acted")
+                     and not l.get("acted")
                      and l["symbol"] not in self.desync_alerted}
             stale = {r for r in roots
                      if now0.timestamp() - self._bars.get(r, {}).get("ts", 0) > BARS_REFRESH_SEC}
@@ -910,6 +917,14 @@ class TimeStopWatcher:
                 else:
                     self._adopt_positions(positions, portfolio, now)
                     can_trade = self._reconcile(positions)
+                # Backfill open_px for lots adopted before portfolio data was
+                # available (e.g. adopted during a degraded snapshot).
+                for l in self.lots:
+                    if (l.get("market", "ib") == "ib" and not l.get("open_px")):
+                        info = portfolio.get(l["symbol"]) or {}
+                        px = info.get("market_price")
+                        if px:
+                            l["open_px"] = px
                 if MODE != "off":
                     self._sample_underwater(portfolio)
                     self._evaluate(now, can_trade, self._bars, only_market="ib")
