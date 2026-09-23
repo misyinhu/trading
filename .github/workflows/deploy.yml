@@ -137,8 +137,8 @@ jobs:
             Start-Sleep -Seconds 2
             try {
               $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5
-              if ($r.StatusCode -eq 200 -or $r.StatusCode -eq 503) {  # 503 = partial up (ok for deploy)
-                Write-Host "Service healthy after $(( $i + 1 ) * 5) seconds"
+              if ($r.StatusCode -eq 200) {
+                Write-Host "Service healthy after $(( $i + 1 ) * 2) seconds"
                 $ok = $true; break
               }
             } catch { Write-Host "  Attempt $(( $i + 1 )): $($_.Exception.Message)" }
@@ -159,5 +159,4 @@ jobs:
               Write-Host "[FAIL] $($t.name): $($_.Exception.Message)"
             }
           }
-
 

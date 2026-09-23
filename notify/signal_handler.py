@@ -25,7 +25,7 @@ def _read_signals():
     if not SIGNALS_FILE.exists():
         return {}
     signals = {}
-    with open(SIGNALS_FILE, 'r') as f:
+    with open(SIGNALS_FILE, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -40,7 +40,7 @@ def _read_signals():
 
 def _write_signal(sig: dict):
     SIGNALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(SIGNALS_FILE, 'a') as f:
+    with open(SIGNALS_FILE, 'a', encoding='utf-8') as f:
         f.write(json.dumps(sig, ensure_ascii=False) + '\n')
 
 
