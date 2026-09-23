@@ -265,10 +265,38 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         self._detail_rows = []
         self._detail_deadline = 0.0
         self._detail_merged = False
+        self.daemon_session_ready = False
 
     def _nrid(self):
         self._rid += 1
         return self._rid
+
+    def reset_for_command(self, action, order):
+        """常驻模式：登录会话保持不变，仅重置与单次命令相关的 SPI/state 字段。"""
+        keep = {k: self.state.get(k) for k in (
+            "investor", "trading_day", "front_id", "session_id",
+            "logined", "settled", "profile", "label")}
+        fresh = _init_state(self.state["profile"], self.state.get("label", self.state["profile"]))
+        fresh.update(keep)
+        fresh["daemon_mode"] = True
+        self.state.clear()
+        self.state.update(fresh)
+        self.action = action
+        self.order = order or {}
+        self._main_board_wanted = {
+            (str(x.get("product", "")).upper(), str(x.get("exchange", "")).upper())
+            for x in (self.order.get("products") or [])
+            if x.get("product")
+        } if action == "main_board" else set()
+        self._order_ref = ""
+        self._settled_fired = True
+        self._instr_done = False
+        self._md_done = False
+        self._pos_mult_queue = []
+        self._pos_mult_map = {}
+        self._detail_rows = []
+        self._detail_deadline = 0.0
+        self._detail_merged = False
 
     def OnFrontConnected(self):
         self.state["phase"] = "authenticating"
@@ -334,30 +362,59 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             self.state["settled"] = True
             _log("settlement confirmed")
         self._settled_fired = True
-        if self.action == "depth":
+        if self.state.get("daemon_mode"):
+            # 常驻模式：登录+结算确认完成后进入 idle，等待主线程投递命令
+            self.state["ready"] = True
+            self.state["ready_since"] = time.time()
+            self.daemon_session_ready = True
+            _log("daemon ready, waiting for commands")
+            return
+        self._dispatch_action()
+
+    def _dispatch_action(self):
+        """登录/结算确认完成后，按当前 action 发起对应请求（一次性与常驻模式共用）。"""
+        action = self.action
+        if action == "settlement":
+            try:
+                q = T.CThostFtdcQrySettlementInfoField()
+                day = str(self.order.get("trading_day", "")).strip()
+                q.BrokerID = self.cfg["broker_id"]
+                q.InvestorID = self.state.get("investor") or self.cfg["user"]
+                q.TradingDay = day
+                ret = self.api.ReqQrySettlementInfo(q, self._nrid())
+                _log(f"query settlement day={day or '(today)'} ret={ret}")
+                if ret != 0:
+                    self.state["settlement_done"] = True
+                    self.state["settlement_error"] = f"ReqQrySettlementInfo ret={ret}"
+            except Exception as e:  # noqa: BLE001
+                _log(f"settlement query submit error: {type(e).__name__}: {e}")
+                self.state["settlement_done"] = True
+                self.state["settlement_error"] = str(e)
+            return
+        if action == "depth":
             try:
                 self._do_depth_one()
             except Exception as e:
                 _log(f"depth query submit error: {type(e).__name__}: {e}")
                 self.state["depth_done"] = True
             return
-        if self.action in ("instruments", "main_contract", "main_board"):
+        if action in ("instruments", "main_contract", "main_board"):
             try:
                 self._do_query_instruments()
             except Exception as e:  # noqa: BLE001
                 _log(f"instrument query submit error: {type(e).__name__}: {e}")
                 self._instr_done = True
             return
-        if self.action == "trades":
+        if action == "trades":
             try:
                 self._do_query_trades()
             except Exception as e:  # noqa: BLE001
                 _log(f"trades query submit error: {type(e).__name__}: {e}")
                 self.state["trades_done"] = True
             return
-        if self.action in ("order", "cancel"):
+        if action in ("order", "cancel"):
             try:
-                if self.action == "order":
+                if action == "order":
                     self._do_order()
                 else:
                     self._do_cancel()
@@ -371,6 +428,25 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         q.BrokerID = self.cfg["broker_id"]
         q.InvestorID = self.state["investor"]
         self.api.ReqQryTradingAccount(q, self._nrid())
+
+    def OnRspQrySettlementInfo(self, p, info, n, last):
+        if self.action != "settlement":
+            return
+        err = getattr(info, "ErrorID", 0) if info else 0
+        if err:
+            self.state["settlement_done"] = True
+            self.state["settlement_error"] = f"[{err}] {getattr(info,'ErrorMsg','')}"
+            return
+        if p is not None:
+            chunk = getattr(p, "Content", "") or ""
+            if chunk:
+                self.state.setdefault("settlement_parts", []).append(str(chunk))
+        if last:
+            parts = self.state.get("settlement_parts") or []
+            raw = "".join(parts)
+            self.state["settlement_content"] = raw
+            self.state["settlement_done"] = True
+            _log(f"settlement content {len(raw)} chars")
 
     def OnRspQryTradingAccount(self, p, info, n, last):
         if p is not None:
@@ -456,27 +532,27 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         if self._detail_merged:
             return
         self._detail_merged = True
-        # 按合约聚合明细：净多空方向 + 手数加权开仓均价 + 最早开仓日期
+        # 按 (合约, 开仓方向) 聚合明细。锁仓（同品种多空并存）时聚合查询会返回
+        # 多条行（Direction 2多/3空），绝不能按合约合并成净方向，否则空单行被误标成多。
         agg = {}
         for r in getattr(self, "_detail_rows", []):
-            d = agg.setdefault(r["symbol"], {"buy": 0, "sell": 0, "pv": 0.0,
-                                             "dates": []})
-            if r["direction"] == "1":
-                d["sell"] += r["volume"]
-            else:
-                d["buy"] += r["volume"]
+            key = (r["symbol"], str(r["direction"]))  # 明细 Direction: 0买开/1卖开
+            d = agg.setdefault(key, {"vol": 0, "pv": 0.0, "dates": []})
+            d["vol"] += r["volume"]
             d["pv"] += r["open_price"] * r["volume"]
             if r["open_date"]:
                 d["dates"].append(r["open_date"])
         for pos in self.state.get("positions", []):
             sym = pos.get("symbol")
-            d = agg.get(sym)
+            # 聚合查询 PosiDirection: '2'多→明细买开0；'3'空→明细卖开1；'1'净保留
+            raw_dir = str(pos.get("direction") or "")
+            open_dir = {"2": "0", "3": "1"}.get(raw_dir, raw_dir)
+            d = agg.get((sym, open_dir))
             pos.pop("open_cost", None)
             pos.setdefault("margin", 0.0)
-            if d and (d["buy"] + d["sell"]) > 0:
-                total = d["buy"] + d["sell"]
-                pos["direction"] = "1" if d["sell"] > d["buy"] else "0"
-                pos["avg_price"] = round(d["pv"] / total, 4)
+            if d and d["vol"] > 0:
+                pos["direction"] = "1" if open_dir == "1" else "0"
+                pos["avg_price"] = round(d["pv"] / d["vol"], 4)
                 pos["open_date"] = min(d["dates"]) if d["dates"] else ""
             else:
                 # 明细缺失：方向置空，均价回退为 0（避免把盯市总额误显示成单价）
@@ -939,85 +1015,53 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             self.state["error"] = f"rsp error [{err}] {msg}"
 
 
-def run(action: str = "query", order: dict | None = None, timeout: float = 30.0,
-        profile: str | None = None) -> dict:
-    global _API, _SPI, _STATE
-    if not Path(_CTP_SWG_PATH).exists():
-        return {"ok": False, "status": "unavailable", "error": f"CTP SWIG not found: {_CTP_SWG_PATH}"}
-    if T is None:
-        return {"ok": False, "status": "unavailable", "error": f"import thosttraderapi fail: {_IMP_ERR}"}
+def _init_state(profile: str, label: str) -> dict:
+    return {"phase": "init", "error": "", "investor": "", "trading_day": "",
+            "account": None, "positions": [], "logined": False,
+            "settled": False, "acct_done": False, "pos_done": False,
+            "settlement_done": False, "settlement_error": "", "settlement_content": "",
+            "front_id": 0, "session_id": 0,
+            "order_events": [], "trade_events": [], "instruments": [], "orders": [],
+            "trades": [], "trades_done": False, "trades_error": "",
+            "_trades_q_done": False, "_orders_q_done": False,
+            "market": {},
+            "action_done": False, "action_result": None, "order_ref": "",
+            "profile": profile, "label": label,
+            "ready": False}
 
-    profile = (profile or os.environ.get("CTP_PROFILE", "simnow")).strip().lower()
-    if profile not in _PROFILES:
-        return {"ok": False, "status": "bad_profile", "profile": profile,
-                "error": f"未知 CTP profile={profile}，可选：{', '.join(_PROFILES)}"}
-    cfg = _load_config(profile)
-    if cfg.get("_missing"):
-        return {"ok": False, "status": "not_configured", "profile": profile, "label": cfg.get("label", profile),
-                "error": f"中信/CTP profile={profile} 缺少配置：{', '.join(cfg['_missing'])}"
-                         f"（交易前置 td_server / broker_id / app_id / 账号 / 密码 / 认证码需向券商索取后填入 secrets/环境变量）"}
-    _STATE = state = {"phase": "init", "error": "", "investor": "", "trading_day": "",
-                      "account": None, "positions": [], "logined": False,
-                      "settled": False, "acct_done": False, "pos_done": False,
-                      "front_id": 0, "session_id": 0,
-                      "order_events": [], "trade_events": [], "instruments": [], "orders": [],
-                      "trades": [], "trades_done": False, "trades_error": "",
-                      "_trades_q_done": False, "_orders_q_done": False,
-                      "market": {},
-                      "action_done": False, "action_result": None, "order_ref": "",
-                      "profile": profile, "label": cfg.get("label", profile)}
 
-    api = T.CThostFtdcTraderApi.CreateFtdcTraderApi("")
-    spi = TraderSpi(api, cfg, state, action=action, order=order)
-    _API, _SPI = api, spi
-    api.RegisterSpi(spi)
-    api.SubscribePrivateTopic(2)
-    api.SubscribePublicTopic(2)
-    api.RegisterFront(cfg["td_server"])
-    api.Init()
-
-    deadline = time.time() + timeout
-    action_wait = 6.0  # 报单/撤单后额外等待回报的宽限
-    action_deadline = None
-    while time.time() < deadline:
-        if state["phase"] == "error":
-            break
-        if action in ("order", "cancel"):
-            if state["settled"] and action_deadline is None:
-                action_deadline = time.time() + action_wait
-            if state["action_done"]:
-                break
-            if action_deadline is not None and time.time() > action_deadline:
-                _log(f"action wait timeout ({action_wait}s) -> return current result")
-                break
-        elif action == "trades":
-            if state.get("trades_done") or (state.get("_trades_q_done") and state.get("_orders_q_done")):
-                break
-        elif action == "depth":
-            if state.get("depth_done"):
-                break
-        elif action == "instruments":
-            if spi._instr_done:
-                break
-        elif action in ("main_contract", "main_board"):
-            if spi._md_done:
-                break
-        else:
-            if (state["logined"] and not state["pos_done"] and spi._detail_deadline
-                    and time.time() > spi._detail_deadline):
-                # 明细回调缺失（如部分柜台/绑定不支持）时，按聚合字段兜底收口
-                spi._merge_position_detail()
-            if state["logined"] and state["pos_done"]:
-                break
-        time.sleep(0.1)
-
-    try:
-        api.Release()
-    except Exception:  # noqa: BLE001
-        pass
-
+def _action_finished(state: dict, spi, action: str, action_deadline) -> bool:
     if state["phase"] == "error":
-        return {"ok": False, "status": "error", "profile": profile, "error": state["error"] or "unknown"}
+        return True
+    if action in ("order", "cancel"):
+        if state["action_done"]:
+            return True
+        if action_deadline is not None and time.time() > action_deadline:
+            _log(f"action wait timeout -> return current result")
+            return True
+        return False
+    if action == "trades":
+        return bool(state.get("trades_done") or
+                    (state.get("_trades_q_done") and state.get("_orders_q_done")))
+    if action == "settlement":
+        return bool(state.get("settlement_done"))
+    if action == "depth":
+        return bool(state.get("depth_done"))
+    if action == "instruments":
+        return bool(spi._instr_done)
+    if action in ("main_contract", "main_board"):
+        return bool(spi._md_done)
+    if (state["logined"] and not state["pos_done"] and spi._detail_deadline
+            and time.time() > spi._detail_deadline):
+        spi._merge_position_detail()
+    return bool(state["logined"] and state["pos_done"])
+
+
+def _build_result(state: dict, cfg: dict, action: str, order: dict) -> dict:
+    profile = state["profile"]
+    if state["phase"] == "error":
+        return {"ok": False, "status": "error", "profile": profile,
+                "error": state["error"] or "unknown"}
     if not state["logined"]:
         return {"ok": False, "status": "timeout", "profile": profile,
                 "error": f"login timeout (phase={state['phase']})"}
@@ -1105,14 +1149,19 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0,
         out["status"] = "depth"
         out["ok"] = bool(state.get("depth"))
         return out
+    if action == "settlement":
+        out["content"] = state.get("settlement_content", "")
+        out["status"] = "settlement"
+        if state.get("settlement_error"):
+            return {"ok": False, "status": "settlement_error", "profile": profile,
+                    "error": state["settlement_error"]}
+        out["ok"] = bool(state.get("settlement_content"))
+        return out
     if action == "instruments":
         insts = state.get("instruments", [])
         tradable = [x for x in insts if x.get("is_trading")] or insts
-        # 主力合约：可交易中按 expire_date 最近（次近月通常即主力的简单启发；
-        # 真实主力按持仓量，需行情/持仓查询——这里给出可交易月份列表供上层选择）。
         out["instruments"] = insts
         out["tradable_count"] = len(tradable)
-        # 选“最近到期且可交易”的月份作为默认主力候选
         future = sorted(tradable, key=lambda x: (x.get("expire_date") or "99999999"))
         out["front_contract"] = future[0] if future else None
         out["status"] = "instruments"
@@ -1125,13 +1174,56 @@ def run(action: str = "query", order: dict | None = None, timeout: float = 30.0,
         out["order_events"] = state["order_events"]
         out["trade_events"] = state["trade_events"]
         out["orders"] = state.get("orders", [])
-        # 报单/撤单以柜台回报为准；挂单成功（accepted/partial/filled/canceled）即 ok
         out["ok"] = bool(r.get("ok"))
         out["status"] = r.get("status", "no_report")
         if not r.get("ok") and not r.get("error"):
             out["ok"] = False
     return out
 
+
+def run(action: str = "query", order: dict | None = None, timeout: float = 30.0,
+        profile: str | None = None) -> dict:
+    global _API, _SPI, _STATE
+    if not Path(_CTP_SWG_PATH).exists():
+        return {"ok": False, "status": "unavailable", "error": f"CTP SWIG not found: {_CTP_SWG_PATH}"}
+    if T is None:
+        return {"ok": False, "status": "unavailable", "error": f"import thosttraderapi fail: {_IMP_ERR}"}
+
+    profile = (profile or os.environ.get("CTP_PROFILE", "simnow")).strip().lower()
+    if profile not in _PROFILES:
+        return {"ok": False, "status": "bad_profile", "profile": profile,
+                "error": f"未知 CTP profile={profile}，可选：{', '.join(_PROFILES)}"}
+    cfg = _load_config(profile)
+    if cfg.get("_missing"):
+        return {"ok": False, "status": "not_configured", "profile": profile, "label": cfg.get("label", profile),
+                "error": f"中信/CTP profile={profile} 缺少配置：{', '.join(cfg['_missing'])}"
+                         f"（交易前置 td_server / broker_id / app_id / 账号 / 密码 / 认证码需向券商索取后填入 secrets/环境变量）"}
+
+    _STATE = state = _init_state(profile, cfg.get("label", profile))
+    api = T.CThostFtdcTraderApi.CreateFtdcTraderApi("")
+    spi = TraderSpi(api, cfg, state, action=action, order=order)
+    _API, _SPI = api, spi
+    api.RegisterSpi(spi)
+    api.SubscribePrivateTopic(2)
+    api.SubscribePublicTopic(2)
+    api.RegisterFront(cfg["td_server"])
+    api.Init()
+
+    deadline = time.time() + timeout
+    action_wait = 6.0
+    action_deadline = None
+    while time.time() < deadline:
+        if action in ("order", "cancel") and state["settled"] and action_deadline is None:
+            action_deadline = time.time() + action_wait
+        if _action_finished(state, spi, action, action_deadline):
+            break
+        time.sleep(0.1)
+
+    try:
+        api.Release()
+    except Exception:  # noqa: BLE001
+        pass
+    return _build_result(state, cfg, action, order or {})
 
 if __name__ == "__main__":
     _action = os.environ.get("CTP_ACTION", "query").strip().lower()

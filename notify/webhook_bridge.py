@@ -1917,16 +1917,21 @@ def get_positions_endpoint():
 
         manager = get_ib_manager()
         ib = manager.get_connection()
-        positions = manager.run_sync(lambda: ib.positions(), timeout=10)
+        # positions() 只给持仓量/均价，盈亏要走 portfolio()（PortfolioItem 含
+        # unrealizedPNL/marketPrice/marketValue）。两者非零持仓一致，直接用 portfolio。
+        positions = manager.run_sync(lambda: ib.portfolio(), timeout=10)
         result = []
         for p in positions:
             result.append(
                 {
                     "symbol": p.contract.symbol,
                     "position": p.position,
-                    "avgCost": p.avgCost,
+                    "avgCost": p.averageCost,
                     "account": p.account,
                     "contract": str(p.contract),
+                    "marketPrice": p.marketPrice,
+                    "marketValue": p.marketValue,
+                    "unrealizedPNL": p.unrealizedPNL,
                 }
             )
         return jsonify({"positions": result, "count": len(result)})
@@ -2599,6 +2604,92 @@ def _ctp_python() -> str:
     return os.environ.get("CTP_PYTHON") or sys.executable
 
 
+# ── 常驻 CTP daemon（登录一次、命令复用会话）─────────────────────
+_CTP_DAEMON_PORTS = {"simnow": 5011, "citic": 5012, "live": 5013}
+_ctp_daemon_lock = threading.Lock()
+_ctp_daemon_procs: dict = {}
+
+
+def _ctp_daemon_port(profile: str) -> int:
+    return int(os.environ.get("CTP_DAEMON_PORT", 0)) or _CTP_DAEMON_PORTS.get(profile, 5012)
+
+
+def _ctp_daemon_listening(profile: str) -> bool:
+    """端口是否在 accept（不代表会话 ready）。只要 daemon 进程活着，桥就不得
+    回退拉起一次性 worker——否则同账号双重登录会互踢会话。"""
+    import socket as _sock
+    try:
+        with _sock.create_connection(("127.0.0.1", _ctp_daemon_port(profile)), timeout=0.6):
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ctp_daemon_ensure(profile: str):
+    """确保 per-profile daemon 进程在跑（端口未监听时拉起，detached 独立存活）。"""
+    import socket as _sock
+    port = _ctp_daemon_port(profile)
+    try:
+        with _sock.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    with _ctp_daemon_lock:
+        proc = _ctp_daemon_procs.get(profile)
+        if proc is not None and proc.poll() is None:
+            return True  # 已在启动中
+        daemon = Path(PROJECT_ROOT) / "ctp_client" / "ctp_daemon.py"
+        try:
+            kwargs = {"cwd": PROJECT_ROOT, "stdout": subprocess.DEVNULL,
+                      "stderr": subprocess.DEVNULL, "stdin": subprocess.DEVNULL}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
+                                          | getattr(subprocess, "DETACHED_PROCESS", 0))
+            proc = subprocess.Popen(
+                [_ctp_python(), "-u", str(daemon),
+                 "--profile", profile, "--port", str(port)], **kwargs)
+            _ctp_daemon_procs[profile] = proc
+            _debug(f"started ctp daemon profile={profile} port={port} pid={proc.pid}")
+        except Exception as e:  # noqa: BLE001
+            _debug(f"start ctp daemon fail: {e}")
+            return False
+    # 等待监听就绪（登录需数秒，这里只等端口 accept，不等 ready）
+    for _ in range(20):
+        try:
+            import socket as _sock
+            with _sock.create_connection(("127.0.0.1", port), timeout=0.5):
+                return True
+        except Exception:  # noqa: BLE001
+            time.sleep(0.5)
+    return False
+
+
+def _ctp_daemon_call(profile: str, action: str, order: dict,
+                     timeout: float) -> dict | None:
+    """通过常驻 daemon 执行一条命令；daemon 不可用返回 None（调用方回退子进程）。"""
+    if os.environ.get("CTP_DAEMON", "1") == "0":
+        return None
+    port = _ctp_daemon_port(profile)
+    try:
+        import socket as _sock
+        with _sock.create_connection(("127.0.0.1", port), timeout=1.5) as s:
+            s.settimeout(timeout + 5.0)
+            payload = {"id": f"{int(time.time()*1000)}", "profile": profile,
+                       "action": action, "order": order or {}, "timeout": timeout}
+            s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            f = s.makefile("rb")
+            line = f.readline()
+        if not line:
+            return None
+        return json.loads(line.decode("utf-8", errors="replace"))
+    except Exception as e:  # noqa: BLE001
+        _debug(f"ctp daemon call fail ({profile}/{action}): {e}")
+        if _ctp_daemon_ensure(profile):
+            # 刚拉起的 daemon 可能仍在登录；返回 not_ready 语义由调用方决定回退
+            return None
+        return None
+
+
 def _ctp_snapshot(force: bool = False, timeout: float = 30.0, profile: str = "simnow"):
     """在独立子进程运行 CTP worker，返回账户+持仓快照 dict。
 
@@ -2613,6 +2704,23 @@ def _ctp_snapshot(force: bool = False, timeout: float = 30.0, profile: str = "si
         if not force and slot["data"] is not None and now - slot["ts"] < _CTP_SNAPSHOT_TTL:
             data = slot["data"]
             return bool(data.get("ok")), data
+    if force:
+        _ctp_daemon_ensure(profile)
+    result = _ctp_daemon_call(profile, "query", {}, min(timeout, 12.0))
+    if result is not None and result.get("status") != "not_ready":
+        with _ctp_snap_lock:
+            if result.get("ok"):
+                _ctp_snapshot_cache[profile] = {"ts": time.time(), "data": result}
+        return bool(result.get("ok")), result
+    if _ctp_daemon_listening(profile):
+        # daemon 进程活着但会话未就绪（登录/重连中）：不回退子进程，避免双登录互踢
+        stale = None
+        with _ctp_snap_lock:
+            stale = (slot.get("data"))
+        if stale is not None:
+            return bool(stale.get("ok")), stale
+        return False, {"ok": False, "status": "warming_up", "profile": profile,
+                       "error": "CTP 会话登录/重连中，请稍后自动重试"}
     worker = Path(PROJECT_ROOT) / "ctp_client" / "ctp_worker.py"
     try:
         _ctp_env = {**os.environ, "CTP_PROFILE": profile}
@@ -2655,6 +2763,16 @@ def _ctp_run_action(action: str, order: dict, timeout: float = 40.0, profile: st
     if profile == "simnow" and not _simnow_enabled():
         return False, {"ok": False, "status": "disabled",
                        "error": "SimNow/CTP 原生层未启用（simnow.enabled=false）"}
+    # 报单/撤单等高优先动作：确保 daemon 已就绪并走复用会话
+    if action in ("order", "cancel"):
+        _ctp_daemon_ensure(profile)
+    result = _ctp_daemon_call(profile, action, order, min(timeout, 20.0))
+    if result is not None and result.get("status") != "not_ready":
+        return bool(result.get("ok")), result
+    if _ctp_daemon_listening(profile):
+        # daemon 存活但会话未就绪：绝不回退子进程（order/cancel 会重新登录踢掉 daemon）
+        return False, {"ok": False, "status": "warming_up",
+                       "error": "CTP 会话登录/重连中，请稍后重试（未发起重复登录）"}
     worker = Path(PROJECT_ROOT) / "ctp_client" / "ctp_worker.py"
     env = dict(os.environ)
     env["CTP_ACTION"] = action
@@ -2933,6 +3051,30 @@ def api_ctp_positions():
     positions = snap.get("positions", [])
     return jsonify({"positions": positions, "count": len(positions),
                     "status": snap.get("status"), "profile": profile})
+
+
+@app.route("/api/ctp/settlement", methods=["GET"])
+def api_ctp_settlement():
+    """
+    GET /api/ctp/settlement?profile=citic&trading_day=20260914
+    返回指定交易日结算单原文（Content 拼接）；trading_day 留空=当日。
+    5002 仅 simnow/citic；实盘走 5006。
+    """
+    profile = _ctp_norm_profile(request.args.get("profile") or request.args.get("account"))
+    if profile is None:
+        return jsonify({"ok": False, "status": "bad_profile",
+                        "error": "未知/空 CTP profile（5002 仅允许 simnow/citic；实盘走 5006），拒绝静默回落"}), 400
+    trading_day = (request.args.get("trading_day")
+                   or request.args.get("day") or "").strip()
+    ok, res = _ctp_run_action(
+        "settlement", {"trading_day": trading_day},
+        timeout=40.0, profile=profile)
+    if not ok:
+        code = 503 if res.get("status") in ("timeout", "crashed", "not_configured", "disabled") else 400
+        return jsonify(res), code
+    return jsonify({"ok": True, "profile": profile,
+                    "trading_day": trading_day,
+                    "content": res.get("content", "")})
 
 
 @app.route("/api/ctp/order", methods=["POST"])

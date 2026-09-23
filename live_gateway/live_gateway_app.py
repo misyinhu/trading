@@ -2,9 +2,9 @@
 """Winclaw real-money gateway — the ONLY live-money entry point.
 
 - IB live: local IB Gateway/TWS port 4001, funded U account only.
-- CTP live: spawns an isolated ``ctp_client/ctp_worker.py`` subprocess with
-  ``CTP_PROFILE=live`` forced server-side. It never proxies to the simulation
-  bridge (:5002) and never accepts a caller-supplied profile.
+- CTP live: talks to the persistent ``ctp_client/ctp_daemon.py`` daemon on
+  127.0.0.1:5013 (``CTP_PROFILE=live`` forced server-side). It never proxies to
+  the simulation bridge (:5002) and never accepts a caller-supplied profile.
 
 The service intentionally has no simulation routes. Callers must complete their
 own risk gate, manual confirmation, audit, and notification before sending an
@@ -53,19 +53,74 @@ app = Flask(__name__)
 _ctp_query_lock = threading.Lock()
 _ctp_query_cache: dict[str, Any] = {"ts": 0.0, "data": None}
 
+# ─────────────── CTP live persistent daemon (127.0.0.1:5013) ───────────────
+CTP_DAEMON_PORT = int(os.environ.get("CTP_DAEMON_PORT_LIVE", "5013"))
+CTP_DAEMON = PROJECT_ROOT / "ctp_client" / "ctp_daemon.py"
+_ctp_daemon_lock = threading.Lock()
+_ctp_daemon_proc: dict[str, Any] = {}
+
+
+def _ctp_daemon_listening() -> bool:
+    import socket as _sock
+    try:
+        with _sock.create_connection(("127.0.0.1", CTP_DAEMON_PORT), timeout=0.6):
+            return True
+    except OSError:
+        return False
+
+
+def _ctp_daemon_ensure() -> None:
+    if _ctp_daemon_listening():
+        return
+    with _ctp_daemon_lock:
+        if _ctp_daemon_listening():
+            return
+        python_exe = os.environ.get("CTP_PYTHON") or sys.executable
+        log = open(PROJECT_ROOT / "logs" / "daemon_live.out.log", "ab")
+        proc = subprocess.Popen(
+            [python_exe, "-u", str(CTP_DAEMON),
+             "--profile", CTP_PROFILE, "--port", str(CTP_DAEMON_PORT)],
+            cwd=PROJECT_ROOT, stdout=log, stderr=subprocess.STDOUT)
+        _ctp_daemon_proc["proc"] = proc
+
+
+def _ctp_daemon_call(action: str, order: dict, timeout: float) -> dict | None:
+    import socket as _sock
+    try:
+        with _sock.create_connection(("127.0.0.1", CTP_DAEMON_PORT), timeout=1.5) as s:
+            s.settimeout(timeout + 5.0)
+            payload = {"id": f"{int(time.time()*1000)}", "profile": CTP_PROFILE,
+                       "action": action, "order": order or {}, "timeout": timeout}
+            s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            line = s.makefile("rb").readline()
+        return json.loads(line.decode("utf-8", "replace")) if line else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _ctp_daemon_wait_ready(deadline_s: float) -> bool:
+    end = time.time() + deadline_s
+    while time.time() < end:
+        r = _ctp_daemon_call("ping", {}, 4.0)
+        if r and r.get("ok"):
+            return True
+        time.sleep(1.0)
+    return False
+
 
 def _ctp_worker(action: str, order: dict | None = None, timeout: float = 40.0,
                 use_cache: bool = False) -> tuple[bool, dict]:
-    """Run ctp_worker.py in a subprocess with CTP_PROFILE=live forced.
+    """Route live CTP work to the persistent daemon (CTP_PROFILE forced).
 
-    A native SWIG crash only kills the subprocess, never this Flask service.
-    Returns (ok, payload).
+    The daemon is a separate OS process, so a native SWIG crash never reaches
+    this Flask service. Returns (ok, payload).
     """
     order = dict(order or {})
     # profile/account are server-controlled for the live gateway; never trust
     # caller-supplied values.
     order.pop("profile", None)
     order.pop("account", None)
+    order["profile"] = CTP_PROFILE
 
     if use_cache:
         now = time.time()
@@ -74,48 +129,27 @@ def _ctp_worker(action: str, order: dict | None = None, timeout: float = 40.0,
             if cached is not None and now - _ctp_query_cache["ts"] < CTP_QUERY_TTL:
                 return bool(cached.get("ok")), cached
 
-    env = {
-        **os.environ,
-        "CTP_PROFILE": CTP_PROFILE,
-        "CTP_ACTION": action,
-        "CTP_ORDER_JSON": json.dumps(order, ensure_ascii=False),
-        "CTP_TIMEOUT": str(timeout),
-    }
-    python_exe = os.environ.get("CTP_PYTHON") or sys.executable
-    try:
-        proc = subprocess.run(
-            [python_exe, "-u", str(CTP_WORKER)],
-            cwd=PROJECT_ROOT, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout, env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return False, {"ok": False, "status": "timeout", "profile": CTP_PROFILE,
-                       "error": f"CTP live 子进程超时（{timeout}s）"}
-    except Exception as e:  # noqa: BLE001
-        return False, {"ok": False, "status": "error", "profile": CTP_PROFILE,
-                       "error": f"启动 CTP live 子进程失败: {e}"}
+    if not _ctp_daemon_listening():
+        _ctp_daemon_ensure()
+        # 冷启动（连接→认证→登录→结算确认）：等 daemon ready，最多 25s
+        if not _ctp_daemon_wait_ready(min(timeout, 25.0)):
+            return False, {"ok": False, "status": "warming_up", "profile": CTP_PROFILE,
+                           "error": "CTP 实盘会话登录/重连中，请稍后自动重试"}
 
-    result = None
-    for line in (proc.stdout or "").splitlines():
-        if line.startswith("RESULT_JSON="):
-            try:
-                result = json.loads(line[len("RESULT_JSON="):])
-            except Exception:  # noqa: BLE001
-                result = None
+    cmd_timeout = min(timeout, 20.0) if action in ("order", "cancel") else min(timeout, 12.0)
+    result = _ctp_daemon_call(action, order, cmd_timeout)
     if result is None:
-        tail = (proc.stderr or "").strip().splitlines()
-        tail = [t for t in tail if "[ctp]" in t][-4:] or tail[-3:]
-        return False, {"ok": False, "status": "crashed", "profile": CTP_PROFILE,
-                       "error": f"CTP live 原生子进程异常退出（exit={proc.returncode}）"
-                                + (f"；日志: {' | '.join(tail)}" if tail else "")}
+        if _ctp_daemon_listening():
+            return False, {"ok": False, "status": "warming_up", "profile": CTP_PROFILE,
+                           "error": "CTP 实盘会话繁忙，请稍后自动重试（未发起重复登录）"}
+        return False, {"ok": False, "status": "error", "profile": CTP_PROFILE,
+                       "error": "CTP daemon 未运行"}
     result.setdefault("profile", CTP_PROFILE)
     if use_cache and result.get("ok") and action == "query":
         with _ctp_query_lock:
             _ctp_query_cache["ts"] = time.time()
             _ctp_query_cache["data"] = result
     return bool(result.get("ok")), result
-
-
 def _ctp_http_code(ok: bool, payload: dict) -> int:
     if ok:
         return 200
@@ -617,6 +651,19 @@ def ctp_live_positions():
     positions = snap.get("positions", [])
     return jsonify({"positions": positions, "count": len(positions),
                     "status": snap.get("status"), "profile": CTP_PROFILE})
+
+
+@app.get("/api/ctp/settlement")
+def ctp_live_settlement():
+    trading_day = (request.args.get("trading_day")
+                   or request.args.get("day") or "").strip()
+    ok, res = _ctp_worker(
+        "settlement", {"trading_day": trading_day}, timeout=40.0)
+    if not ok:
+        return jsonify(res), _ctp_http_code(ok, res)
+    return jsonify({"ok": True, "profile": CTP_PROFILE,
+                    "trading_day": trading_day,
+                    "content": res.get("content", "")})
 
 
 @app.get("/api/ctp/trades")
