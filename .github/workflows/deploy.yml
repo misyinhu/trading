@@ -11,11 +11,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-#           - host: winclaw
-#             runs_on: ["self-hosted", "windows", "winclaw", "trading-bridge"]
-#             deploy_path: "C:\\projects\\trading"
-#             py: "C:\\Users\\wang\\AppData\\Local\\Programs\\Python\\Python313\\python.exe"
-#             git_ssh: ""
+          - host: winclaw
+            runs_on: ["self-hosted", "windows", "winclaw", "trading-bridge"]
+            deploy_path: "C:\\projects\\trading"
+            py: "C:\\Users\\wang\\AppData\\Local\\Programs\\Python\\Python313\\python.exe"
+            git_ssh: ""
           - host: cxclaw
             runs_on: ["self-hosted", "windows", "cxclaw", "trading-bridge"]
             deploy_path: "D:\\projects\\trading"
