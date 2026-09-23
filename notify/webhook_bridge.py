@@ -2852,6 +2852,199 @@ def _gm_enabled() -> bool:
     return bool(_gm_credentials()["token"])
 
 
+# -- 常驻 gm history daemon（run() 框架只冷启动一次，热查询走任务目录）--
+_GM_DAEMON_JOBS_DIR = r"C:\projects\gm_env\gm_jobs"
+_GM_DAEMON = {"proc": None, "started": 0.0}
+_GM_DAEMON_LOCK = threading.RLock()
+_GM_DAEMON_READY_STALE_SEC = 60.0
+_GM_DAEMON_COLDSTART_GRACE_SEC = 180.0
+_GM_DAEMON_RESULT_TTL_SEC = 3 * 3600.0
+
+
+def _gm_jobs_dir() -> str:
+    d = os.environ.get("GM_JOBS_DIR", _GM_DAEMON_JOBS_DIR).replace("\\", "/")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    return d
+
+
+def _gm_daemon_read_heartbeat() -> dict | None:
+    p = _gm_jobs_dir() + "/daemon_heartbeat.json"
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _gm_daemon_start_locked() -> None:
+    gm_py = os.environ.get("GM_PYTHON", r"C:\projects\gm_env\Scripts\python.exe")
+    gm_dir = os.environ.get("GM_ENV_DIR", r"C:\projects\gm_env")
+    worker = os.path.join(PROJECT_ROOT, "notify", "gm_daemon_worker.py")
+    cred = _gm_credentials()
+    env = dict(os.environ)
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+              "ALL_PROXY", "all_proxy"):
+        env.pop(k, None)
+    env["GM_TOKEN"] = cred["token"]
+    env["GM_SERV_ADDR"] = cred["addr"]
+    env["GM_JOBS_DIR"] = _gm_jobs_dir()
+    log = open(os.path.join(gm_dir, "gm_daemon.log"), "ab")
+    creationflags = 0x00000008 if os.name == "nt" else 0  # DETACHED_PROCESS
+    proc = subprocess.Popen([gm_py, "-u", worker], cwd=gm_dir,
+                            stdout=log, stderr=subprocess.STDOUT,
+                            env=env, creationflags=creationflags)
+    _GM_DAEMON["proc"] = proc
+    _GM_DAEMON["started"] = time.time()
+
+
+def _gm_daemon_status_locked() -> dict:
+    proc = _GM_DAEMON.get("proc")
+    hb = _gm_daemon_read_heartbeat()
+    alive = proc is not None and proc.poll() is None
+    now = time.time()
+    if not alive:
+        state = "down"
+    elif hb and hb.get("status") == "ready" and \
+            now - float(hb.get("ts", 0)) < _GM_DAEMON_READY_STALE_SEC:
+        state = "ready"
+    elif hb and hb.get("status") == "busy" and \
+            now - float(hb.get("ts", 0)) < _GM_DAEMON_READY_STALE_SEC:
+        state = "busy"
+    elif now - float(_GM_DAEMON.get("started") or now) < _GM_DAEMON_COLDSTART_GRACE_SEC:
+        state = "starting"
+    else:
+        state = "stale"
+    return {"daemon": state, "pid": getattr(proc, "pid", None),
+            "heartbeat_age": round(now - float(hb.get("ts", 0)), 1) if hb else None,
+            "done": (hb or {}).get("done"), "last_error": (hb or {}).get("last_error")}
+
+
+def _gm_daemon_ensure() -> dict:
+    """确保 worker 在跑；进程死/心跳僵死且超出冷启动宽限则重启。"""
+    with _GM_DAEMON_LOCK:
+        st = _gm_daemon_status_locked()
+        if st["daemon"] in ("down", "stale"):
+            proc = _GM_DAEMON.get("proc")
+            try:
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            _gm_daemon_start_locked()
+            st = _gm_daemon_status_locked()
+        return st
+
+
+def _gm_daemon_gc_results_locked() -> None:
+    now = time.time()
+    for p in glob.glob(_gm_jobs_dir() + "/result_*.json"):
+        try:
+            if now - os.path.getmtime(p) > _GM_DAEMON_RESULT_TTL_SEC:
+                os.remove(p)
+        except OSError:
+            pass
+
+
+def _gm_daemon_monitor_loop() -> None:
+    while True:
+        time.sleep(30.0)
+        try:
+            with _GM_DAEMON_LOCK:
+                _gm_daemon_ensure()
+                _gm_daemon_gc_results_locked()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+threading.Thread(target=_gm_daemon_monitor_loop, name="gm-daemon-monitor",
+                 daemon=True).start()
+
+
+def _gm_result_path(cid: str) -> str:
+    return f"{_gm_jobs_dir()}/result_{cid}.json"
+
+
+def _gm_task_path(cid: str) -> str:
+    return f"{_gm_jobs_dir()}/task_{cid}.json"
+
+
+def _gm_read_result(cid: str) -> dict | None:
+    try:
+        with open(_gm_result_path(cid), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _gm_enqueue(cid: str, order: dict) -> None:
+    tp = _gm_task_path(cid)
+    if os.path.exists(tp):
+        return
+    order = dict(order)
+    order["enqueued_ts"] = time.time()
+    tmp = tp + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(order, f, ensure_ascii=False)
+    os.replace(tmp, tp)
+
+
+@app.route("/api/gm/history_async", methods=["GET", "POST"])
+def api_gm_history_async():
+    """
+    常驻 daemon 热查询：submit 与 poll 同端点。
+    submit: ?symbol=&frequency=1m&start_time=&end_time=（可带 cid 幂等）
+    poll:   ?cid=<client-id>
+    status: queued / done / error；daemon: starting/busy/ready。
+    冷启动只在 worker 首次/重启时发生一次，期间请求在任务目录排队，不报错。
+    """
+    cid = (request.values.get("cid", "") or "").strip()
+    if cid:
+        result = _gm_read_result(cid)
+        if result is not None:
+            status = "done" if result.get("ok") else "error"
+            return jsonify({"ok": True, "cid": cid, "status": status,
+                            "result": result}), 200
+        if os.path.exists(_gm_task_path(cid)):
+            return jsonify({"ok": True, "cid": cid, "status": "queued",
+                            "daemon": _gm_daemon_ensure()}), 200
+        return jsonify({"ok": False, "error": "job not found"}), 404
+
+    symbol = (request.values.get("symbol", "") or "").strip()
+    if not symbol:
+        return jsonify({"ok": False, "error": "missing symbol"}), 400
+    if not _gm_enabled():
+        return jsonify({"ok": False, "status": "disabled",
+                        "error": "掘金未配置（缺 GM_TOKEN）"}), 503
+    order = {
+        "symbol": symbol,
+        "frequency": request.values.get("frequency", "1h"),
+        "start_time": request.values.get("start_time", ""),
+        "end_time": request.values.get("end_time", ""),
+    }
+    import hashlib
+    cid = (request.values.get("new_cid", "") or "").strip() or \
+        hashlib.md5(json.dumps(
+            [order["symbol"], order["frequency"],
+             order["start_time"], order["end_time"]],
+            ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    result = _gm_read_result(cid)
+    if result is None:
+        _gm_enqueue(cid, order)
+    status = "done" if result is not None and result.get("ok") else \
+        ("error" if result is not None else "queued")
+    return jsonify({"ok": True, "cid": cid, "status": status,
+                    "result": result, "daemon": _gm_daemon_ensure()}), 200
+
+
+@app.route("/api/gm/daemon", methods=["GET"])
+def api_gm_daemon_status():
+    with _GM_DAEMON_LOCK:
+        return jsonify({"ok": True, **_gm_daemon_status_locked()}), 200
+
+
 def _gm_run(action: str, order: dict | None = None, timeout: float = 45.0,
             force: bool = False):
     """在 gm_env 子进程跑掘金策略框架，返回 (ok, payload)。
