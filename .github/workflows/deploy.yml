@@ -16,11 +16,11 @@ jobs:
             deploy_path: "C:\\projects\\trading"
             py: "C:\\Users\\wang\\AppData\\Local\\Programs\\Python\\Python313\\python.exe"
             git_ssh: ""
-# TEMP_DISABLED:           - host: cxclaw
-# TEMP_DISABLED:             runs_on: ["self-hosted", "windows", "cxclaw", "trading-bridge"]
-# TEMP_DISABLED:             deploy_path: "D:\\projects\\trading"
-# TEMP_DISABLED:             py: "C:\\Users\\Apple\\AppData\\Local\\Programs\\Python\\Python312\\python.exe"
-# TEMP_DISABLED:             git_ssh: "ssh -i C:/Users/Apple/.ssh/id_ed25519_trading -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          - host: cxclaw
+            runs_on: ["self-hosted", "windows", "cxclaw", "trading-bridge"]
+            deploy_path: "D:\\projects\\trading"
+            py: "C:\\Users\\Apple\\AppData\\Local\\Programs\\Python\\Python312\\python.exe"
+            git_ssh: "ssh -i C:/Users/Apple/.ssh/id_ed25519_trading -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
     runs-on: ${{ matrix.runs_on }}
     env:
       DEPLOY_PATH: ${{ matrix.deploy_path }}
@@ -159,4 +159,5 @@ jobs:
               Write-Host "[FAIL] $($t.name): $($_.Exception.Message)"
             }
           }
+
 
