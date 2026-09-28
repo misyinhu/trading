@@ -24,6 +24,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+# Windows redirects stdout/stderr to files using the OEM/ANSI codepage (GBK on
+# zh-CN), which raises UnicodeEncodeError when notifiers print emoji (❌/✅).
+# That print error was bubbling up and failing the whole feishu notify. Force
+# UTF-8 with replacement so logging can never break the send path.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
+
 from flask import Flask, jsonify, request
 from ib_insync import IB, LimitOrder, MarketOrder, Stock, util
 
@@ -274,13 +284,25 @@ class IBLiveManager:
                     "account_id": target, "managed": managed}
         return self.run_sync(job, 20)
 
-    def positions(self) -> list[dict]:
+    def positions(self, account: str | None = None) -> list[dict]:
         def job():
             ib = self.start()
-            target = self._target_account(ib)
+            managed = list(ib.managedAccounts() or [])
+            if account is None:
+                targets = [self._target_account(ib)]
+            elif account == "all":
+                targets = managed
+            elif account in managed:
+                targets = [account]
+            else:
+                raise RuntimeError(f"unknown account={account}; managed={managed}")
+            # TWS 在连接后建立/同步持仓时 position 事件可能未推送，导致 ib.positions() 缓存为空。
+            # 显式重请一次并等待事件回填，避免 GrossPositionValue>0 却取不到持仓。
+            ib.reqPositions()
+            ib.sleep(1.5)
             rows = []
             for p in ib.positions():
-                if p.account != target:
+                if p.account not in targets:
                     continue
                 c = p.contract
                 rows.append({"symbol": c.symbol, "position": p.position, "avgCost": p.avgCost,
@@ -543,7 +565,8 @@ def ib_live_account():
 @app.get("/api/ib/live/positions")
 def ib_live_positions():
     try:
-        rows = manager.positions()
+        account = (request.args.get("account") or "").strip() or None
+        rows = manager.positions(account)
         return jsonify({"positions": rows, "count": len(rows)})
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 503
