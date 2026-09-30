@@ -1,0 +1,74 @@
+quant_core:
+  # cxclaw：quant-server IB 数据实时正常（2026-09-21 验证，MNQ 5m 返回真实 OHLCV）。
+  url: http://100.82.238.11:8005
+paper:
+  # 内盘（onshore CTP 期货）纸面日内数据源主备：tqsdk 主 / CTP 备（2026-09-24 收敛，
+  # 见 docs/data-architecture.md §二）。改回 CTP 主力改此行即可；环境变量
+  # PAPER_ONSHORE_DATA_PRIMARY 可覆盖。外盘（IB/OKX）走 quant-core，不受此配置影响。
+  onshore_data_primary: tqsdk
+trading:
+  url: http://100.82.238.11:5002  # cxclaw（2026-09-18 起统一；winclaw gm 子进程超时）
+# 实盘固定网关（winclaw）：IB 实盘 + CTP live 的唯一入口，不随模拟交易桥 trading.url 切换。
+# 内部固定连 winclaw IB Gateway 4001；CTP 请求由网关直连本机 ctp_worker 子进程并强制
+# CTP_PROFILE=live（不再代理 5002；5002 自 2026-09-19 起仅允许 simnow/citic）。
+# 环境变量 LIVE_GATEWAY_URL 可覆盖。
+live_gateway:
+  url: http://100.99.204.126:5006
+  ib_account: "U8590961"
+  manual_order: true  # 仅允许交易员页人工二次确认报单；Agent 自动信号仍禁止
+ctp_live:
+  url: http://100.99.204.126:5006
+tradingview:
+  local_host: 127.0.0.1
+  local_cdp_port: 9224
+  local_mcp_dir: /Users/wang/.opencode/workspace/tradingview-mcp
+  ssh_host: wang@100.99.204.126
+  direct_host: 100.99.204.126
+  cdp_port: 9224
+ctp_swig:
+  simnow_path: C:\tmp\ctp_api\ctp_swig_build-6.7.11.1\ctp_api
+  citic_path: C:\tmp\ctp_api\ctp_swig_build-6.5.1cp\ctp_api
+  # 正式版CTP 实盘（投资者 821350082，中信标准协议实盘，2026-09-17 人工实盘测试）。
+  # worker 与凭证由 winclaw live_gateway(5006) 直连 ctp_worker 持有；Mac 侧不存任何 live 凭证。
+  # 注意：live 前置走标准 CTP 协议，必须用 6.7.11.1（6.5.1_CP 是中信评测前置专用，会 4040/decode err）。
+  live_path: C:\tmp\ctp_api\ctp_swig_build-6.7.11.1\ctp_api
+  python: C:\Users\Apple\AppData\Local\Programs\Python\Python313\python.exe
+# CTP profile 名册：simnow/citic 经模拟桥 5002；live 经实盘网关 5006（5002 已拒绝 live）。
+# live 为真实资金账户：仅人工报/撤单，每笔过 ctp_live 实盘风控门 + 飞书通知；
+# agent 不得对 live 自动下单（红线，见 tools/trading_adapter.py）。
+ctp_profiles:
+  simnow:
+    label: 上期官方仿真
+    investor: "274467"
+    mode: sim
+  citic:
+    label: 中信期货仿真
+    investor: "7108804861"
+    mode: sim
+  live:
+    label: 正式版CTP（中信实盘·只读/仅人工）
+    investor: "821350082"
+    mode: live
+    auto_trade: false
+ctp_md:
+  # 常驻行情 worker（独立进程；MdApi tick 内存快照，微秒级，无流控）。
+  # host 默认跟随上方 trading.url（worker 与报单桥同机部署，换桥即跟着切）；
+  # 临时指到别的机器时显式填 host（或环境变量 CTP_MD_HOST）。
+  # SWIG 版本不同，simnow/citic 必须分 profile 分进程（5003/5004）。
+  host: ""
+  simnow_port: 5003
+  citic_port: 5004
+data_health:
+  endpoint: http://127.0.0.1:5003/api/data/health
+  port_note: 5001 被 coze-intake-webhook 占用，quant-agent spine proxy 跑 5003
+  active_server: winclaw
+  probes:
+  - ib
+  - ctp_citic
+  - ctp_simnow
+  - ctp_live   # 只读探活，绝不下单
+  - gm
+  - okx
+  description: data_agent 数据源健康探测（跨服务器聚合）
+# 历史本地 IB Gateway 配置已废弃：实盘 IB 已固定迁移到 winclaw live_gateway，
+# Mac 本机 4001/4002 不再作为 quant-agent 的实盘依赖。
