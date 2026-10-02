@@ -910,10 +910,12 @@ class TimeStopWatcher:
                 now = _now()
                 self._refresh_hedge(now)
                 if not snapshot_ok:
-                    # Snapshot failed: positions is NOT "flat", just unknown.
-                    # Skip reconcile/adopt so a transient connection error can
-                    # never delete lots that are still open at the counter.
-                    can_trade = False
+                    # Snapshot failed: positions is unknown.
+                    # Reconcile against empty list: lots whose net qty != 0
+                    # will be cleared (they are flat), or flagged as desync
+                    # (still open at counter but unreadable).
+                    self._adopt_positions([], {}, now)
+                    can_trade = self._reconcile([])
                 else:
                     self._adopt_positions(positions, portfolio, now)
                     can_trade = self._reconcile(positions)

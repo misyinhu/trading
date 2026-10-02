@@ -609,7 +609,22 @@ def ib_live_time_stop_desync_clear():
     result = time_stop.clear_desync(sym)
     return jsonify(result)
 
-@app.post("/api/ib/live/time-stop/tick")
+@app.post("/api/ib/live/time-stop/lot-clear")
+def ib_live_time_stop_lot_clear():
+    """手动清除指定品种的所有 watcher lot（人工确认持仓已平后使用）。
+    body: {"symbol": "MYM"}"""
+    body = request.get_json(force=True, silent=True) or {}
+    sym = str(body.get("symbol") or "").strip()
+    if not sym:
+        return jsonify({"error": "symbol required"}), 400
+    with time_stop._lock:
+        before = len(time_stop.lots)
+        time_stop.lots = [l for l in time_stop.lots if l["symbol"] != sym]
+        after = len(time_stop.lots)
+        time_stop._save()
+    return jsonify({"cleared": sym, "removed": before - after, "remaining": after})
+
+
 def ib_live_time_stop_tick():
     """Manual evaluation tick (useful for checks). Never places orders unless
     TIME_STOP_MODE=enforce and a lot actually breaches the 3h limit."""
