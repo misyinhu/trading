@@ -621,6 +621,10 @@ def ib_live_time_stop_lot_clear():
         before = len(time_stop.lots)
         time_stop.lots = [l for l in time_stop.lots if l["symbol"] != sym]
         after = len(time_stop.lots)
+        # A manual force-clear is a human decision, so no leftover flat
+        # confirmation may carry over and fire another clear.
+        time_stop._flat_confirm.pop(sym, None)
+        time_stop.desync_alerted.discard(sym)
         time_stop._save()
     return jsonify({"cleared": sym, "removed": before - after, "remaining": after})
 

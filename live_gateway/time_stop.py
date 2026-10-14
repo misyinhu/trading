@@ -37,6 +37,13 @@ GB_YELLOW = float(os.environ.get("TIME_STOP_GB_YELLOW", "1.0"))  # giveback ATR 
 MODE = os.environ.get("TIME_STOP_MODE", "audit").strip().lower()
 STATE_PATH = Path(os.environ.get("TIME_STOP_STATE", "data/time_stop_state.json"))
 AUDIT_PATH = Path(os.environ.get("TIME_STOP_AUDIT", "data/time_stop_audit.jsonl"))
+# Consecutive SUCCESSFUL counter reads that must agree "this symbol is flat"
+# before the watcher drops its tracking record. IB omits flat contracts from
+# positions(), so one empty read cannot tell a real close apart from a
+# degraded feed; 2 in a row is the cheap discriminator.
+FLAT_CONFIRM_N = int(os.environ.get("TIME_STOP_FLAT_CONFIRM_N", "2"))
+# Don't re-notify an ongoing snapshot outage more often than this.
+SNAP_FAIL_NOTIFY_SEC = int(os.environ.get("TIME_STOP_SNAP_FAIL_NOTIFY_SEC", "600"))
 # Structure alerts (added 2026-09-19, evidence: trader_agent
 # range_to_breakout.md): notify-only, NEVER trigger orders in any mode.
 # ATR = trailing median 5m bar range of the last 20 bars (price units).
@@ -197,6 +204,11 @@ class TimeStopWatcher:
         self._thread: threading.Thread | None = None
         self.last_tick: dict[str, Any] = {}
         self.manual: dict[str, str] = {}   # key "ib:ROOT"/"ctp:ROOT" -> true|false
+        # symbol -> consecutive successful reads that agreed "flat". Only a
+        # value reaching FLAT_CONFIRM_N authorises dropping the lots.
+        self._flat_confirm: dict[str, int] = {}
+        self._snap_fail_notified_at: float = 0.0
+        self._snap_fail_reason: str = ""
         self._ctp_provider = None
         self._ctp_closer = None
         self._ctp_bars_provider = None
@@ -571,8 +583,23 @@ class TimeStopWatcher:
                          f"{'做多' if pos > 0 else '做空'} {abs(pos):g}；"
                          "监控时长自现在起算（接入前真实持有时长未知），2h 警戒 / 3h 离场规则即刻生效")
 
-    def _reconcile(self, positions: list[dict]) -> bool:
-        """Compare net qty per symbol with positions. Return False if desync."""
+    def _reconcile(self, positions: list[dict], snapshot_ok: bool = True) -> bool:
+        """Compare net qty per symbol with positions. Return False if desync.
+
+        snapshot_ok=False means the counter read FAILED, so `positions` is
+        UNKNOWN — not flat. IB omits flat contracts from positions(), which
+        makes an empty list byte-for-byte identical to a failed read if you
+        only look at the data. An unknown read must therefore never mutate
+        tracking state: clearing lots on it silently drops a still-open
+        position out of the 2h/3h time stop and re-arms its clock from zero
+        on the next adopt.
+        """
+        if not snapshot_ok:
+            # Break the confirmation chain: an unreadable snapshot is not
+            # evidence, so it cannot count as "still flat".
+            self._flat_confirm.clear()
+            self._notify_snapshot_stale()
+            return False
         net: dict[str, float] = defaultdict(float)
         for l in self.lots:
             if l.get("market", "ib") != "ib":
@@ -589,21 +616,53 @@ class TimeStopWatcher:
             # have been in the counter but not tracked before this session.
             if sym in adopted:
                 self.desync_alerted.discard(sym)
+                self._flat_confirm.pop(sym, None)
                 continue
             if abs(net.get(sym, 0.0) - pnet.get(sym, 0.0)) > 1e-6:
                 if abs(pnet.get(sym, 0.0)) < 1e-9:
-                    # position is flat: close all lots for this symbol (close orders
-                    # may have been filled outside tracked fills, or position was
-                    # closed manually in IB)
+                    # Counter reads flat for this symbol. Hold the confirmation
+                    # before acting on it.
+                    n = self._flat_confirm.get(sym, 0) + 1
+                    self._flat_confirm[sym] = n
+                    if n < FLAT_CONFIRM_N:
+                        # Still ambiguous: the lot is tracked but the counter
+                        # says zero. Pause this symbol's time stop rather than
+                        # pick a side.
+                        ok = False
+                        self._audit("flat_pending_confirm",
+                                    {"symbol": sym, "confirm": n,
+                                     "need": FLAT_CONFIRM_N,
+                                     "lots": len([x for x in self.lots
+                                                  if x["symbol"] == sym])})
+                        if sym not in self.desync_alerted:
+                            self.desync_alerted.add(sym)
+                            self._notify(
+                                f"[WARN] 品种 {sym} 账户快照读数为 0，但尚未连续确认"
+                                f"（{n}/{FLAT_CONFIRM_N}）：watcher 仍保留该持仓记录，"
+                                "时间止损已暂停；可能是刚平仓待确认，也可能是行情快照不稳。"
+                                f"再连续 {FLAT_CONFIRM_N - n} 次快照仍为 0 才会清除记录，"
+                                "若期间持仓仍在请人工核对")
+                            self._audit("flat_pending_alert",
+                                        {"symbol": sym, "confirm": n,
+                                         "need": FLAT_CONFIRM_N})
+                        continue
+                    # Confirmed flat across FLAT_CONFIRM_N successful reads:
+                    # close orders may have filled outside tracked fills, or the
+                    # position was closed manually in IB.
                     roots = [self._mkey(l) for l in self.lots if l["symbol"] == sym]
                     self.lots = [l for l in self.lots if l["symbol"] != sym]
                     self.desync_alerted.discard(sym)
+                    self._flat_confirm.pop(sym, None)
                     for k in roots:
                         self.manual.pop(k, None)
-                    self._notify(f"[INFO] 品种 {sym} 账户净持仓已归零，watcher 同步清除对应的持仓记录")
-                    self._audit("reconcile_flat_clear", {"symbol": sym})
+                    self._notify(
+                        f"[INFO] 品种 {sym} 账户净持仓已归零（连续 {n} 次快照确认），"
+                        "watcher 同步清除对应的持仓记录")
+                    self._audit("reconcile_flat_clear",
+                                {"symbol": sym, "confirm": n})
                     continue
                 ok = False
+                self._flat_confirm.pop(sym, None)   # counter disagrees; break chain
                 if sym not in self.desync_alerted:
                     self.desync_alerted.add(sym)
                     self._notify(f"[WARN] 持仓数据不一致：品种 {sym}，watcher 记录净持仓 {net.get(sym,0):g}，"
@@ -612,7 +671,37 @@ class TimeStopWatcher:
                     self._audit("desync", {"symbol": sym, "lot": net.get(sym, 0), "pos": pnet.get(sym, 0)})
             elif sym in self.desync_alerted:
                 self.desync_alerted.discard(sym)
+            self._flat_confirm.pop(sym, None)   # healthy read; break chain
         return ok
+
+    def _notify_snapshot_stale(self) -> None:
+        """Tell the operator the counter read failed and tracking is frozen.
+        Rate-limited so a long IB outage does not produce one message per tick.
+        The wording must never resemble a close: this is an unknown read."""
+        now = time.time()
+        if (now - self._snap_fail_notified_at) < SNAP_FAIL_NOTIFY_SEC:
+            return
+        self._snap_fail_notified_at = now
+        tracked = sorted({l["symbol"] for l in self.lots
+                          if l.get("market", "ib") == "ib"})
+        if not tracked:
+            return
+        self._notify(
+            f"[WARN] 账户持仓快照读取失败，持仓状态未知（非清仓）："
+            f"watcher 保留全部持仓记录 {('、'.join(tracked)) or '无'}，"
+            "时间止损与对账已暂停直到快照恢复；"
+            "期间不会清除任何持仓记录，请检查 IB Gateway 连接")
+
+    def _snapshot_recovered(self) -> None:
+        """One-shot note that the outage ended, so a frozen watcher that comes
+        back is visible rather than silently resuming."""
+        if not self._snap_fail_reason:
+            return
+        reason, self._snap_fail_reason = self._snap_fail_reason, ""
+        self._notify(f"[INFO] 账户持仓快照已恢复读取（中断原因 {reason}），"
+                     "对账与时间止损恢复运行")
+        self._audit("ib_snapshot_recovered", {"reason": reason})
+
 
     # ── evaluation ───────────────────────────────────────────────
     def _structure_alert(self, l: dict, now: datetime, age: float,
@@ -897,6 +986,7 @@ class TimeStopWatcher:
                 self._audit("ib_snapshot_skip", {"error": str(snap_err)[:120]})
                 fills, positions, portfolio, fresh = [], [], {}, {}
                 snapshot_ok = False
+                self._snap_fail_reason = str(snap_err)[:120]
             for r, pack in fresh.items():
                 pack["ts"] = now0.timestamp()
                 self._bars[r] = pack
@@ -909,16 +999,17 @@ class TimeStopWatcher:
                         self._apply_fill(f)
                 now = _now()
                 self._refresh_hedge(now)
-                if not snapshot_ok:
-                    # Snapshot failed: positions is unknown.
-                    # Reconcile against empty list: lots whose net qty != 0
-                    # will be cleared (they are flat), or flagged as desync
-                    # (still open at counter but unreadable).
-                    self._adopt_positions([], {}, now)
-                    can_trade = self._reconcile([])
-                else:
+                # Snapshot failed => positions is UNKNOWN, not flat. Never
+                # adopt, never clear, never claim desync off a read that never
+                # happened: an empty list here is what a real flat account also
+                # looks like, so the two cannot be told apart from the data.
+                if snapshot_ok:
+                    self._snapshot_recovered()
                     self._adopt_positions(positions, portfolio, now)
-                    can_trade = self._reconcile(positions)
+                    can_trade = self._reconcile(positions, snapshot_ok=True)
+                else:
+                    self._adopt_positions([], {}, now)
+                    can_trade = self._reconcile([], snapshot_ok=False)
                 # Backfill open_px for lots adopted before portfolio data was
                 # available (e.g. adopted during a degraded snapshot).
                 for l in self.lots:
@@ -944,6 +1035,10 @@ class TimeStopWatcher:
             sym = str(symbol or "").strip()
             if sym in self.desync_alerted:
                 self.desync_alerted.discard(sym)
+                # Drop any partial flat confirmation too: the human just said
+                # "hold this tracking record", so a leftover count must not be
+                # able to complete a clear on the very next tick.
+                self._flat_confirm.pop(sym, None)
                 self._save()
                 self._audit("desync_cleared_manual", {"symbol": sym})
                 return {"ok": True, "symbol": sym, "desync_symbols": sorted(self.desync_alerted)}
@@ -974,7 +1069,10 @@ class TimeStopWatcher:
                          "metrics": l.get("metrics")})
         return {"mode": MODE, "warn_h": WARN_SEC / 3600, "stop_h": STOP_SEC / 3600,
                 "last_tick": self.last_tick, "lots": rows,
-                "desync_symbols": sorted(self.desync_alerted)}
+                "desync_symbols": sorted(self.desync_alerted),
+                "flat_confirm": dict(self._flat_confirm),
+                "flat_confirm_n": FLAT_CONFIRM_N,
+                "snapshot_read_ok": self._snap_fail_reason == ""}
 
     def start(self) -> None:
         if MODE == "off" or self._thread:
