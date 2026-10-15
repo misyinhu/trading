@@ -2608,6 +2608,8 @@ def _ctp_python() -> str:
 _CTP_DAEMON_PORTS = {"simnow": 5011, "citic": 5012, "live": 5013}
 _ctp_daemon_lock = threading.Lock()
 _ctp_daemon_procs: dict = {}
+_ctp_daemon_last_start: dict = {}
+_CTP_DAEMON_RESTART_BACKOFF = 60.0  # 抽风期防 daemon 抖动：两次拉起至少间隔 60s
 
 
 def _ctp_daemon_port(profile: str) -> int:
@@ -2638,6 +2640,12 @@ def _ctp_daemon_ensure(profile: str):
         proc = _ctp_daemon_procs.get(profile)
         if proc is not None and proc.poll() is None:
             return True  # 已在启动中
+        now = time.time()
+        last = _ctp_daemon_last_start.get(profile, 0.0)
+        if now - last < _CTP_DAEMON_RESTART_BACKOFF:
+            _debug(f"skip ctp daemon restart profile={profile} "
+                   f"(backoff {now - last:.0f}s<{_CTP_DAEMON_RESTART_BACKOFF:.0f}s)")
+            return False
         daemon = Path(PROJECT_ROOT) / "ctp_client" / "ctp_daemon.py"
         try:
             kwargs = {"cwd": PROJECT_ROOT, "stdout": subprocess.DEVNULL,
@@ -2649,6 +2657,7 @@ def _ctp_daemon_ensure(profile: str):
                 [_ctp_python(), "-u", str(daemon),
                  "--profile", profile, "--port", str(port)], **kwargs)
             _ctp_daemon_procs[profile] = proc
+            _ctp_daemon_last_start[profile] = now
             _debug(f"started ctp daemon profile={profile} port={port} pid={proc.pid}")
         except Exception as e:  # noqa: BLE001
             _debug(f"start ctp daemon fail: {e}")

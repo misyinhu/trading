@@ -26,7 +26,11 @@ import socketserver
 import sys
 import threading
 import time
-import msvcrt
+try:
+    import msvcrt  # Windows
+except ImportError:  # POSIX（dev/mac 测试可导入运行）
+    msvcrt = None
+    import fcntl
 from pathlib import Path
 
 # ctp_worker 在模块导入时即按 CTP_PROFILE 选择 SWIG 绑定目录（中信 CP 柜台必须
@@ -69,24 +73,33 @@ class _Session:
                 api.RegisterFront(self.cfg["td_server"])
                 api.Init()
                 self.api, self.spi, self.state = api, spi, state
+                # 2026-10-16 8h 抽风根因修复：登录 30s 未就绪时不再 Release+重建。
+                # 前置机抖动期 Release 与 CTP 回调线程竞争会原生 abort，进程被杀 →
+                # 桥再拉新 daemon → 再 30s 超时 → 再 abort，形成 18-20s 死循环。
+                # 正确做法与 md worker 一致：会话只建一次，断线靠 CTP 原生自动重连，
+                # 这里无限期等 ready（每 60s 打一条等待日志），显式 login error 才退。
                 deadline = time.time() + 30
-                while time.time() < deadline and not state.get("ready"):
+                last_wait_log = 0.0
+                while not state.get("ready"):
                     if state.get("phase") == "error":
-                        raise RuntimeError(state.get("error", "login error"))
-                    time.sleep(0.1)
-                if not state.get("ready"):
-                    raise RuntimeError("login timeout")
+                        # 显式错误（如认证失败）不会自愈：直接退进程（不 Release，
+                        # 避免退出路径再触发原生 abort），由桥带 backoff 重启。
+                        W._log(f"[daemon {self.profile}] login error: "
+                               f"{state.get('error', 'unknown')}，退出待重启")
+                        os._exit(2)
+                    now = time.time()
+                    if now >= deadline and now - last_wait_log >= 60:
+                        last_wait_log = now
+                        W._log(f"[daemon {self.profile}] 等待 CTP 登录就绪中"
+                               f"（{int(now - deadline) + 30}s，靠原生重连）")
+                    time.sleep(0.5)
                 W._log(f"[daemon {self.profile}] session ready")
-                while self.alive and state.get("phase") != "disconnected":
+                # 断线不退出、不重建：CTP 原生会 OnFrontDisconnected→自动重连→
+                # OnFrontConnected→重认证→重登录，全程复用同一 api 实例。
+                while self.alive:
                     time.sleep(1.0)
             except Exception as e:  # noqa: BLE001
                 W._log(f"[daemon {self.profile}] connect error: {type(e).__name__}: {e}")
-            try:
-                if self.api is not None:
-                    self.api.Release()
-            except Exception:  # noqa: BLE001
-                pass
-            self.api = None
             time.sleep(3.0)
 
     def execute(self, action: str, order: dict, timeout: float) -> dict:
@@ -123,7 +136,8 @@ class _Session:
                         "error": f"{type(e).__name__}: {e}"}
 
     def _force_reconnect(self):
-        """查询无响应：立即摘掉 ready 标记并释放连接，_connect 线程会自动重登。"""
+        """查询无响应：立即摘掉 ready 标记。不再 Release api——跨线程 Release
+        会原生 abort（2026-10-16 抽风根因），CTP 原生心跳发现断线后自动重登。"""
         try:
             self.spi.daemon_session_ready = False
         except Exception:  # noqa: BLE001
@@ -132,15 +146,6 @@ class _Session:
             self.state["phase"] = "disconnected"
         except Exception:  # noqa: BLE001
             pass
-        api = self.api
-
-        def _release():
-            try:
-                if api is not None:
-                    api.Release()
-            except Exception:  # noqa: BLE001
-                pass
-        threading.Thread(target=_release, daemon=True).start()
 
     def health(self) -> dict:
         return {"ok": bool(getattr(self.spi, "daemon_session_ready", False)),
@@ -161,7 +166,10 @@ def _acquire_single_lock(profile: str) -> bool:
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         f = open(lock_path, "a+b")
-        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        if msvcrt is not None:
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         f.seek(0)
         f.truncate()
         f.write(str(os.getpid()).encode())

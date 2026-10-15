@@ -311,6 +311,9 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
     def OnFrontDisConnected(self, reason):
         self.state["phase"] = "disconnected"
         self.state["error"] = f"front disconnected reason={reason}"
+        # daemon 模式下摘掉就绪标记：健康检查/命令派发立即感知，
+        # 之后由 CTP 原生自动重连恢复（不 Release、不重建会话）。
+        self.daemon_session_ready = False
         _log(self.state["error"])
 
     def OnRspAuthenticate(self, p, info, n, b):
@@ -478,7 +481,7 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
                 if float(vol) != 0:
                     self.state["positions"].append({
                         "symbol": getattr(p, "InstrumentID", ""),
-                        "direction": str(getattr(p, "Direction", "")),
+                        "direction": str(getattr(p, "PosiDirection", "")),
                         "volume": int(float(vol)),
                         # OpenCost=开仓总额(价×量×乘数)；均价待查到合约乘数后换算
                         "open_cost": float(getattr(p, "OpenCost", 0) or 0),
@@ -986,6 +989,33 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
             }
             self.state["trade_events"].append(tr)
             _log(f"OnRtnTrade ref={tr['order_ref']} px={tr['price']} vol={tr['volume']}")
+            # H8 成交回写：任何 CTP 成交（含 spine HTTP 超时/兜底路径下的成交）
+            # 都落本地事件并 POST quant-agent :5001，framework 不再丢账。
+            # 2026-10-15 22:12 webhook_bridge 兜底 close 成交但 spine 无 ack 的教训。
+            try:
+                import sys as _sys
+                from pathlib import Path as _P
+                _root = str(_P(__file__).resolve().parent.parent)
+                if _root not in _sys.path:
+                    _sys.path.insert(0, _root)
+                from notify.event_writer import write_event_callback
+                ref = tr.get("order_ref") or ""
+                # order_ref 形如 {strategy}-{epoch}-{seq}-{purpose}，strategy 含下划线
+                sig_id = ref.rsplit("-", 3)[0] if ref.count("-") >= 3 else ""
+                if sig_id:
+                    write_event_callback(sig_id, "ORDER_FILLED", {
+                        "symbol": tr.get("instrument_id"),
+                        "exchange": tr.get("exchange_id"),
+                        "action": tr.get("direction"),
+                        "offset_flag": tr.get("offset_flag"),
+                        "quantity": tr.get("volume"),
+                        "avg_price": tr.get("price"),
+                        "order_id": tr.get("order_sys_id") or ref,
+                        "trade_id": tr.get("trade_id"),
+                        "source": "ctp",
+                    }, agent="trading")
+            except Exception as _e:  # noqa: BLE001
+                _log(f"OnRtnTrade writeback fail: {type(_e).__name__}: {_e}")
         except Exception as e:  # noqa: BLE001
             _log(f"OnRtnTrade parse fail: {e}")
 

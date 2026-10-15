@@ -16,22 +16,25 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-EVENT_WRITE_PATH = os.environ.get(
-    "EVENT_WRITE_PATH",
-    str(Path(__file__).parent.parent / "logs" / "trading_events.jsonl")
-)
+_DEFAULT_WRITE_PATH = str(Path(__file__).parent.parent / "logs" / "trading_events.jsonl")
+_DEFAULT_SEQ_FILE = str(Path(__file__).parent.parent / "logs" / "trading_events.seq")
 
-SEQ_FILE = os.environ.get(
-    "EVENT_SEQ_FILE",
-    str(Path(__file__).parent.parent / "logs" / "trading_events.seq")
-)
 
-Path(EVENT_WRITE_PATH).parent.mkdir(parents=True, exist_ok=True)
+def _write_path() -> str:
+    # 调用时读取（非 import 时）：测试/多进程可用环境变量重定向，互不影响。
+    return os.environ.get("EVENT_WRITE_PATH", _DEFAULT_WRITE_PATH)
+
+
+def _seq_file() -> str:
+    return os.environ.get("EVENT_SEQ_FILE", _DEFAULT_SEQ_FILE)
+
+
+Path(_DEFAULT_WRITE_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 
 def _next_seq() -> int:
     """原子递增 seq。"""
-    seq_file = Path(SEQ_FILE)
+    seq_file = Path(_seq_file())
     if seq_file.exists():
         seq = int(seq_file.read_text().strip() or "0") + 1
     else:
@@ -52,7 +55,7 @@ def write_event(
     Returns:
       {"recorded": True, "already_recorded": False, "event_id": "...", "seq": N}
     """
-    path = Path(EVENT_WRITE_PATH)
+    path = Path(_write_path())
     seq = _next_seq()
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -67,15 +70,20 @@ def write_event(
         },
     }
 
-    # 幂等检查：同 signal_id + event_type 是否已存在
+    # 幂等检查：同 signal_id + event_type + 单据键（order_id/trade_id，有则参与）
+    # ——一个信号会有多笔成交，仅按 signal_id+event_type 去重会丢后续成交回写。
+    dedup_key = str(data.get("order_id") or data.get("trade_id") or "")
     already_recorded = False
     if path.exists():
         with open(path) as f:
             for line in f:
                 try:
                     existing = json.loads(line.strip())
-                    if (existing.get("data", {}).get("signal_id") == signal_id
-                            and existing.get("type") == event_type):
+                    ex_data = existing.get("data", {})
+                    ex_key = str(ex_data.get("order_id") or ex_data.get("trade_id") or "")
+                    if (ex_data.get("signal_id") == signal_id
+                            and existing.get("type") == event_type
+                            and ex_key == dedup_key):
                         already_recorded = True
                         break
                 except Exception:
