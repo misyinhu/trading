@@ -49,14 +49,19 @@ def tsmod(monkeypatch, tmp_path):
 def _watcher(tsmod, lots_spec):
     """Build a watcher with hand-built IB lots and no external manager."""
     w = tsmod.TimeStopWatcher.__new__(tsmod.TimeStopWatcher)
-    w.lots = [dict(symbol=sym, root=sym, qty=qty, market="ib",
+    now = tsmod._now().isoformat()
+    w.lots = [dict(symbol=sym, root=sym, qty=qty, market="ib", grp="index",
+                   dir="long", sec_type="FUT",
+                   open_dt=now, clock_dt=now,
+                   warned=False, acted=False, uw=0, tot=0,
+                   last_pnl=None, light=None, exec=[],
                    **{k: v for k, v in extra.items()})
               for sym, qty, extra in lots_spec]
     w.seen_exec = set()
     w.desync_alerted = set()
     w.manual = {f"ib:{sym}": "false" for sym, _q, _e in lots_spec}
     w._flat_confirm = {}
-    w._snap_fail_notified_at = 0.0
+    w._snap_down = False
     w._snap_fail_reason = ""
     w.last_tick = {}
     return w
@@ -101,6 +106,76 @@ def test_failed_snapshot_is_rate_limited(tsmod):
         w._reconcile([], snapshot_ok=False)
 
     assert len(tsmod.sent) == 1, f"outage should notify once, got {tsmod.sent}"
+
+
+def test_long_outage_still_notifies_only_once(tsmod):
+    """The 2026-10-15 regression: an 8.7h outage emitted ~52 identical
+    messages under the periodic re-send. One outage must mean one message."""
+    w = _watcher(tsmod, [("MNQ", 2, {}), ("XAGUSD", 200, {})])
+
+    for _ in range(2000):                      # ~16.6h at 30s/tick
+        w._reconcile([], snapshot_ok=False)
+
+    assert len(tsmod.sent) == 1, \
+        f"one outage must produce one message, got {len(tsmod.sent)}"
+
+
+def test_outage_and_recovery_each_speak_once(tsmod):
+    """Edge pair: down once, healed once. Recovery must not re-arm silence."""
+    w = _watcher(tsmod, [("MNQ", 2, {})])
+
+    for _ in range(50):
+        w._reconcile([], snapshot_ok=False)
+    w._snapshot_recovered()
+
+    assert len(tsmod.sent) == 2, f"expected outage+recovery, got {tsmod.sent}"
+    assert any("读取失败" in m for m in tsmod.sent)
+    assert any("已恢复读取" in m for m in tsmod.sent)
+
+    # A second outage is a new event and must speak again.
+    w._reconcile([], snapshot_ok=False)
+    assert len(tsmod.sent) == 3, "a new outage must announce itself"
+
+
+def test_status_reports_outage_despite_empty_error_message(tsmod):
+    """IB raises ConnectionError with an EMPTY message. Using the reason
+    string as the health signal reported 'healthy' through a total outage."""
+    w = _watcher(tsmod, [("MNQ", 2, {})])
+    w._snap_fail_reason = ""          # exactly what IB hands us
+
+    w._reconcile([], snapshot_ok=False)
+
+    assert w._snap_down is True
+    assert w.status()["snapshot_read_ok"] is False, \
+        "status must report the outage even when the exception says nothing"
+
+
+def test_status_reports_healthy_after_recovery(tsmod):
+    w = _watcher(tsmod, [("MNQ", 2, {})])
+    w._reconcile([], snapshot_ok=False)
+    assert w.status()["snapshot_read_ok"] is False
+
+    w._snap_fail_reason = ""
+    w._reconcile([_flat_read("MNQ", 2)], snapshot_ok=True)
+
+    assert w.status()["snapshot_read_ok"] is True
+
+
+def test_outage_is_auditable(tsmod):
+    """The periodic version wrote no audit row, so its send count could not
+    be reconstructed from the log at all."""
+    w = _watcher(tsmod, [("MNQ", 2, {})])
+    mod = tsmod
+    rows = []
+    w._audit = lambda kind, payload: rows.append((kind, payload))
+
+    for _ in range(500):
+        w._reconcile([], snapshot_ok=False)
+
+    outages = [r for r in rows if r[0] == "ib_snapshot_outage"]
+    assert len(outages) == 1, f"outage must be recorded once, got {len(outages)}"
+    assert outages[0][1]["tracked"] == ["MNQ"]
+    assert mod is not None
 
 
 def test_failed_snapshot_makes_no_per_symbol_claim(tsmod):

@@ -117,7 +117,7 @@ def test_flag_survives_restart(tsmod, monkeypatch, tmp_path):
 
     w.seen_exec = set()
     w._flat_confirm = {}
-    w._snap_fail_notified_at = 0.0
+    w._snap_down = False
     w._snap_fail_reason = ""
     w._adopted_this_tick = set()
     w._save()
@@ -128,7 +128,7 @@ def test_flag_survives_restart(tsmod, monkeypatch, tmp_path):
     fresh.manual = {}
     fresh.desync_alerted = set()
     fresh._flat_confirm = {}
-    fresh._snap_fail_notified_at = 0.0
+    fresh._snap_down = False
     fresh._snap_fail_reason = ""
     fresh.last_tick = {}
     fresh._load()

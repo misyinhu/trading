@@ -42,8 +42,6 @@ AUDIT_PATH = Path(os.environ.get("TIME_STOP_AUDIT", "data/time_stop_audit.jsonl"
 # positions(), so one empty read cannot tell a real close apart from a
 # degraded feed; 2 in a row is the cheap discriminator.
 FLAT_CONFIRM_N = int(os.environ.get("TIME_STOP_FLAT_CONFIRM_N", "2"))
-# Don't re-notify an ongoing snapshot outage more often than this.
-SNAP_FAIL_NOTIFY_SEC = int(os.environ.get("TIME_STOP_SNAP_FAIL_NOTIFY_SEC", "600"))
 # Structure alerts (added 2026-09-19, evidence: trader_agent
 # range_to_breakout.md): notify-only, NEVER trigger orders in any mode.
 # ATR = trailing median 5m bar range of the last 20 bars (price units).
@@ -207,7 +205,9 @@ class TimeStopWatcher:
         # symbol -> consecutive successful reads that agreed "flat". Only a
         # value reaching FLAT_CONFIRM_N authorises dropping the lots.
         self._flat_confirm: dict[str, int] = {}
-        self._snap_fail_notified_at: float = 0.0
+        # Explicit outage edge flag. IB's ConnectionError carries an EMPTY
+        # message, so _snap_fail_reason == "" cannot mean "healthy".
+        self._snap_down: bool = False
         self._snap_fail_reason: str = ""
         self._ctp_provider = None
         self._ctp_closer = None
@@ -600,6 +600,10 @@ class TimeStopWatcher:
             self._flat_confirm.clear()
             self._notify_snapshot_stale()
             return False
+        # Recovering is also a transition, and this function owns both edges of
+        # _snap_down. Leaving the healthy edge to the caller lets status() drift
+        # out of sync with reality on any path that does not go through tick().
+        self._snapshot_recovered()
         net: dict[str, float] = defaultdict(float)
         for l in self.lots:
             if l.get("market", "ib") != "ib":
@@ -675,15 +679,25 @@ class TimeStopWatcher:
         return ok
 
     def _notify_snapshot_stale(self) -> None:
-        """Tell the operator the counter read failed and tracking is frozen.
-        Rate-limited so a long IB outage does not produce one message per tick.
-        The wording must never resemble a close: this is an unknown read."""
-        now = time.time()
-        if (now - self._snap_fail_notified_at) < SNAP_FAIL_NOTIFY_SEC:
-            return
-        self._snap_fail_notified_at = now
+        """Announce the read failure ONCE per outage, not once per window.
+
+        A failed read is an EVENT (the link dropped), not a state, so it is
+        edge-triggered: the first failure of an outage speaks, and
+        _snapshot_recovered() speaks again when it heals. The old periodic
+        version re-sent every SNAP_FAIL_NOTIFY_SEC for as long as IB was down —
+        an 8.7h outage produced ~52 near-identical messages.
+
+        The outage flag must be an explicit bool, NOT `reason != ""`: IB raises
+        ConnectionError with an EMPTY message, so a reason-string test reports
+        "healthy" through a total outage.
+        """
+        if self._snap_down:
+            return                      # already announced this outage
+        self._snap_down = True
         tracked = sorted({l["symbol"] for l in self.lots
                           if l.get("market", "ib") == "ib"})
+        self._audit("ib_snapshot_outage", {"tracked": tracked,
+                                           "reason": self._snap_fail_reason or None})
         if not tracked:
             return
         self._notify(
@@ -695,9 +709,11 @@ class TimeStopWatcher:
     def _snapshot_recovered(self) -> None:
         """One-shot note that the outage ended, so a frozen watcher that comes
         back is visible rather than silently resuming."""
-        if not self._snap_fail_reason:
+        if not self._snap_down:
             return
-        reason, self._snap_fail_reason = self._snap_fail_reason, ""
+        reason = self._snap_fail_reason or "IB 返回空异常消息（未提供原因）"
+        self._snap_down = False
+        self._snap_fail_reason = ""
         self._notify(f"[INFO] 账户持仓快照已恢复读取（中断原因 {reason}），"
                      "对账与时间止损恢复运行")
         self._audit("ib_snapshot_recovered", {"reason": reason})
@@ -1010,7 +1026,6 @@ class TimeStopWatcher:
                 # happened: an empty list here is what a real flat account also
                 # looks like, so the two cannot be told apart from the data.
                 if snapshot_ok:
-                    self._snapshot_recovered()
                     self._adopt_positions(positions, portfolio, now)
                     can_trade = self._reconcile(positions, snapshot_ok=True)
                 else:
@@ -1078,7 +1093,7 @@ class TimeStopWatcher:
                 "desync_symbols": sorted(self.desync_alerted),
                 "flat_confirm": dict(self._flat_confirm),
                 "flat_confirm_n": FLAT_CONFIRM_N,
-                "snapshot_read_ok": self._snap_fail_reason == ""}
+                "snapshot_read_ok": not self._snap_down}
 
     def start(self) -> None:
         if MODE == "off" or self._thread:
