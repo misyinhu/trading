@@ -217,11 +217,33 @@ class IBLiveManager:
             raise self._error
         return self._ib  # type: ignore[return-value]
 
+    def _reclaim_client_id(self) -> None:
+        """Evict a zombie session still holding our fixed clientId.
+
+        A process killed without closing its socket leaves IB Gateway holding the
+        clientId, and the next reconnect is rejected with "Error 326" /
+        "Peer closed connection. clientId N already in use?". Connecting once
+        with the same id makes the gateway drop the stale session. Mirrors
+        client/ib_connection.py::_reclaim_client_id, which the webhook bridge
+        has had all along while this gateway connected bare.
+
+        Deliberately never raises: the real connect below reports whatever is
+        genuinely wrong, and a failing probe must not mask or replace that.
+        """
+        try:
+            probe = IB()
+            probe.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID, timeout=3)
+            probe.disconnect()
+            print(f"[IB] reclaimed fixed clientId={IB_CLIENT_ID}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[IB] reclaim clientId={IB_CLIENT_ID} skipped: {e}", flush=True)
+
     def _run(self) -> None:
         try:
             util.patchAsyncio()
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
+            self._reclaim_client_id()
             ib = IB()
             ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID, timeout=10, readonly=False)
             self._ib = ib
