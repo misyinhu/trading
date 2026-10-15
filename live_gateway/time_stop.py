@@ -860,16 +860,22 @@ class TimeStopWatcher:
                                                           "error": str(e)})
                 else:
                     enforce_txt = "当前为仅提醒模式，不会实际平仓" if MODE != "enforce" else "当前不可交易，已暂停自动平仓"
+                    # Notify ONCE, when the line is first crossed. The old code
+                    # re-sent on every 30s tick with no cap ("将持续提醒直至平仓
+                    # 或解除"), which produced 18,030 duplicate Feishu messages
+                    # since 2026-09-21 — ~240/hour once two lots sat past the
+                    # line. Crossing 3h is a state, not an event: record it once
+                    # and let /time-stop/status carry the current state.
+                    # The flag lives on the lot, so it also survives _save()/
+                    # _load() and is not re-armed by a watcher restart.
                     if not l.get("_3h_notified_sent"):
                         l["_3h_notified_sent"] = True
                         self._notify(f"[AUDIT] 3 小时离场提醒：{base}；{enforce_txt}")
-                    else:
-                        self._notify(f"[AUDIT] 再次到达 3 小时离场线（watcher 已记录，将持续提醒直至平仓或解除）：{base}")
-                    self._audit("would_close", {"root": l["root"], "dir": l["dir"],
-                                                "qty": abs(l["qty"]), "age_h": round(age/3600, 2),
-                                                "uw_ratio": round(l["uw"]/l["tot"], 3) if l.get("tot") else None,
-                                                "floating": l.get("last_pnl"),
-                                                "light": l.get("light")})
+                        self._audit("would_close", {"root": l["root"], "dir": l["dir"],
+                                                    "qty": abs(l["qty"]), "age_h": round(age/3600, 2),
+                                                    "uw_ratio": round(l["uw"]/l["tot"], 3) if l.get("tot") else None,
+                                                    "floating": l.get("last_pnl"),
+                                                    "light": l.get("light")})
             elif age >= WARN_SEC and not l["warned"]:
                 l["warned"] = True
                 m = l.get("metrics") or {}
