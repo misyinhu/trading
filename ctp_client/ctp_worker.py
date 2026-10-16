@@ -834,6 +834,10 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
         f.InstrumentID = iid
         rc = self.api.ReqQryDepthMarketData(f, self._nrid())
         _log(f"depth query {iid} ret={rc}")
+        if rc != 0:
+            # 提交失败（流控/参数）：立即完成，否则 depth_done 永不置位
+            # → 命令挂死 → force_reconnect → daemon 自杀循环（2026-10-16 全天抽风根因）
+            self.state["depth_done"] = True
 
     def _do_query_market_data(self):
         # 行情深度查询 CThostFtdcQryDepthMarketDataField 仅支持按 InstrumentID 精确查
@@ -849,7 +853,22 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
     def _do_query_market_board(self):
         # 主力看板只登录一次：合约只收目标品种，行情也只查这些目标合约。
         # 不使用空 InstrumentID 全市场快照，避免数千回调拖慢前端。
-        targets = [x["instrument_id"] for x in self.state.get("instruments", []) if x.get("is_trading")]
+        # 2026-10-16：只查每品种最近 4 个到期月（主力必在其中），
+        # 串行流控 ~1s/合约，全月份会超时；且不查的月份没有 OI，
+        # 也不会被 _pick_main 选中，不影响主力判定。
+        import re as _re
+        groups = {}
+        for x in self.state.get("instruments", []):
+            if not x.get("is_trading"):
+                continue
+            m = _re.match(r"^([A-Za-z]+)([0-9]+)$", x.get("instrument_id", ""))
+            if not m:
+                continue
+            groups.setdefault((m.group(1).upper(), x.get("exchange_id", "")), []).append(x)
+        targets = []
+        for g in groups.values():
+            g.sort(key=lambda x: (x.get("expire_date") or "99999999"))
+            targets.extend(x["instrument_id"] for x in g[:4])
         self.state["_md_queue"] = list(targets)
         self.state["market"] = {}
         _log(f"query target market data for {len(targets)} instruments")
@@ -892,13 +911,20 @@ class TraderSpi(T.CThostFtdcTraderSpi if T is not None else object):
                         _log(f"depth {iid}: {self.state['depth']}")
             except Exception as e:  # noqa: BLE001
                 _log(f"depth market parse fail: {type(e).__name__}: {e}")
+        # depth 单合约查询的兜底完成：合约已摘牌/不存在时回报 p=None（或回报
+        # 根本不来数据、只有 last），depth_done 必须置位——否则命令挂死、
+        # daemon 被判 wedge 自杀重启，全天 3 分钟一循环（au2610/al2610 实测）。
+        if self.action == "depth" and not self.state.get("depth_done"):
+            if p is None or last:
+                iid = str(self.order.get("instrument_id", "") or "").strip()
+                _log(f"depth {iid}: 无数据（合约不存在/已摘牌），按完成处理")
+                self.state["depth"] = {"instrument_id": iid, "no_data": True}
+                self.state["depth_done"] = True
         if last:
-            if self.action == "main_board":
-                self._md_done = True
-            else:
-                # 查询流控：串行查下一合约前稍作等待（worker 独立进程，短暂阻塞回调线程可接受）
-                time.sleep(0.8)
-                self._query_next_market()
+            # 查询流控：串行查下一合约前稍作等待（CTP 查询类限 1 次/秒，
+            # 留 1.05s 余量避免 -2 流控拒答丢合约 OI 导致主力误判）
+            time.sleep(1.05)
+            self._query_next_market()
 
     def _rsp_info(self, info):
         if info is None:
@@ -1120,7 +1146,13 @@ def _build_result(state: dict, cfg: dict, action: str, order: dict) -> dict:
         with_oi = [x for x in tradable if x.get("open_interest")]
         if with_oi:
             return max(with_oi, key=lambda x: x["open_interest"]), "open_interest"
-        fallback = sorted(tradable, key=lambda x: (x.get("expire_date") or "99999999"))
+        # OI 缺失（非交易时段/行情未回）时按最近到期兜底：必须排除已摘牌合约，
+        # 否则周五夜盘等场景会把当日到期的 2610 误报为主力。
+        today = str(state.get("trading_day") or time.strftime("%Y%m%d"))
+        alive = [x for x in tradable
+                 if (x.get("expire_date") or "99999999") >= today]
+        fallback = sorted(alive or tradable,
+                          key=lambda x: (x.get("expire_date") or "99999999"))
         return (fallback[0] if fallback else None), "nearest_expiry_fallback"
 
     if action == "main_board":
