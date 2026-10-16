@@ -2648,8 +2648,13 @@ def _ctp_daemon_ensure(profile: str):
             return False
         daemon = Path(PROJECT_ROOT) / "ctp_client" / "ctp_daemon.py"
         try:
-            kwargs = {"cwd": PROJECT_ROOT, "stdout": subprocess.DEVNULL,
-                      "stderr": subprocess.DEVNULL, "stdin": subprocess.DEVNULL}
+            # daemon stdout/stderr 落盘（原 DEVNULL 导致 8h 抽风期间零可见性）：
+            # logs/ctp_daemon_<profile>.log，append 模式，跨重启保留历史。
+            log_dir = Path(PROJECT_ROOT) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_f = open(log_dir / f"ctp_daemon_{profile}.log", "a", buffering=1)
+            kwargs = {"cwd": PROJECT_ROOT, "stdout": log_f,
+                      "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL}
             if sys.platform == "win32":
                 kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
                                           | getattr(subprocess, "DETACHED_PROCESS", 0))
