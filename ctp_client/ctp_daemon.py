@@ -96,8 +96,22 @@ class _Session:
                 W._log(f"[daemon {self.profile}] session ready")
                 # 断线不退出、不重建：CTP 原生会 OnFrontDisconnected→自动重连→
                 # OnFrontConnected→重认证→重登录，全程复用同一 api 实例。
+                # 但查询挂死触发的 _force_reconnect 只摘标记——若 TCP 层未真断，
+                # 原生重连不会触发，会话会永久 wedge（09:28 开盘事故实测）。
+                # 兜底：持续 not_ready 超过 120s 且原生重连没把 phase 推回
+                # connected 流程，则退进程让桥带 backoff 重启，恢复自愈闭环。
+                not_ready_since = time.time()
                 while self.alive:
                     time.sleep(1.0)
+                    if getattr(self.spi, "daemon_session_ready", False):
+                        not_ready_since = time.time()
+                    elif state.get("phase") not in ("disconnected",):
+                        # 原生重连已启动（authenticating/logging_in），重置计时
+                        not_ready_since = time.time()
+                    elif time.time() - not_ready_since > 120:
+                        W._log(f"[daemon {self.profile}] not_ready 持续 120s "
+                               f"且原生重连未启动，退出待桥重启（自愈）")
+                        os._exit(3)
             except Exception as e:  # noqa: BLE001
                 W._log(f"[daemon {self.profile}] connect error: {type(e).__name__}: {e}")
             time.sleep(3.0)
@@ -109,6 +123,7 @@ class _Session:
                         "error": "CTP 会话未就绪（登录/重连中）"}
             try:
                 # reset 在主线程执行；_dispatch_action 的 Req* 调用通常线程安全
+                W._log(f"[daemon {self.profile}] execute {action} begin")
                 self.spi.reset_for_command(action, order)
                 self.spi._dispatch_action()
             except Exception as e:  # noqa: BLE001
@@ -146,6 +161,8 @@ class _Session:
             self.state["phase"] = "disconnected"
         except Exception:  # noqa: BLE001
             pass
+        W._log(f"[daemon {self.profile}] force_reconnect: 命令超时，摘除 ready 标记"
+               f"（等原生重连；120s 未恢复将退进程自愈）")
 
     def health(self) -> dict:
         return {"ok": bool(getattr(self.spi, "daemon_session_ready", False)),
