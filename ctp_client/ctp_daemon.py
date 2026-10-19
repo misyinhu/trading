@@ -132,7 +132,12 @@ class _Session:
             action_deadline = time.time() + 8.0 if action in ("order", "cancel") else None
             # 查询类硬上限 9s：柜台连接静默断开时回调永不返回，不能让串行锁
             # 被一条死命令长期霸占（否则后续所有命令排队，表现为整柜卡死）。
-            cap = timeout if action in ("order", "cancel") else min(timeout, 9.0)
+            # 例外：instruments/main_contract/main_board 需全市场合约查询 +
+            # 串行行情查询（~1s/合约），本身就要几十秒，给足 timeout。
+            if action in ("order", "cancel", "instruments", "main_contract", "main_board"):
+                cap = timeout
+            else:
+                cap = min(timeout, 9.0)
             deadline = time.time() + cap
             completed = False
             while time.time() < deadline:
@@ -141,6 +146,12 @@ class _Session:
                     break
                 time.sleep(0.05)
             if not completed:
+                if action == "depth":
+                    # 只读行情查询：柜台对摘牌/流控合约可能 ret=0 但永不回调
+                    # （au2610 实测）。绝不能为此 force_reconnect——那会拖死
+                    # 整条会话（下单/持仓全 not_ready，2026-10-19 14:59 事故）。
+                    return {"ok": False, "status": "no_quote", "profile": self.profile,
+                            "error": f"行情查询{cap:.0f}s无回调（合约摘牌/流控），不影响交易会话"}
                 self._force_reconnect()
                 return {"ok": False, "status": "not_ready", "profile": self.profile,
                         "error": f"柜台{action}无响应（{cap:.0f}s），已判定断连并重登，请稍后自动重试"}

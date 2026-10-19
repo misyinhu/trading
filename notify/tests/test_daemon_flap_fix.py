@@ -52,3 +52,13 @@ class TestDedupWithOrderKey:
         r = write_event("sig1", "ORDER_FILLED", {"order_id": "B", "price": 2})
         assert r["already_recorded"] is False
         assert r["recorded"] is True
+
+
+def test_depth_timeout_never_force_reconnect():
+    """摘牌合约 depth 无回调只返 no_quote，不得 force_reconnect 拖死交易会话。"""
+    from ctp_client import ctp_daemon
+    src = inspect.getsource(ctp_daemon._Session.execute)
+    assert 'no_quote' in src
+    # depth 分支内不得出现 force_reconnect
+    depth_part = src.split('if action == "depth"')[1].split('self._force_reconnect')[0]
+    assert '_force_reconnect' not in depth_part
